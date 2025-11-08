@@ -1,0 +1,7 @@
+atomic==0.7.3
+bcrypt==3.2.2
+cffi==2.0.0
+passlib==1.7.4
+pycparser==2.23
+pyescrypt==0.1.0
+scrypt==0.9.4

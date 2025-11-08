@@ -1,0 +1,12 @@
+62    execve("/usr/bin/ls", ["ls", "-la", "labdata"], 0x7ffed073fc58 /* 10 vars */) = 0
+62    openat(AT_FDCWD, "/etc/ld.so.cache", O_RDONLY|O_CLOEXEC) = 3
+62    openat(AT_FDCWD, "/lib/x86_64-linux-gnu/libselinux.so.1", O_RDONLY|O_CLOEXEC) = 3
+62    openat(AT_FDCWD, "/lib/x86_64-linux-gnu/libc.so.6", O_RDONLY|O_CLOEXEC) = 3
+62    openat(AT_FDCWD, "/lib/x86_64-linux-gnu/libpcre2-8.so.0", O_RDONLY|O_CLOEXEC) = 3
+62    openat(AT_FDCWD, "/proc/filesystems", O_RDONLY|O_CLOEXEC) = 3
+62    openat(AT_FDCWD, "/etc/nsswitch.conf", O_RDONLY|O_CLOEXEC) = 3
+62    openat(AT_FDCWD, "/etc/passwd", O_RDONLY|O_CLOEXEC) = 3
+62    openat(AT_FDCWD, "/etc/group", O_RDONLY|O_CLOEXEC) = 3
+62    openat(AT_FDCWD, "labdata", O_RDONLY|O_NONBLOCK|O_CLOEXEC|O_DIRECTORY) = 3
+62    openat(AT_FDCWD, "/etc/localtime", O_RDONLY|O_CLOEXEC) = -1 ENOENT (No such file or directory)
+62    +++ exited with 0 +++

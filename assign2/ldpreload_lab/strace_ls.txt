@@ -1,0 +1,19 @@
+55    execve("/usr/bin/env", ["env", "LD_PRELOAD=./libhide.so", "ls", "-la", "labdata"], 0x7ffddd640958 /* 10 vars */) = 0
+55    openat(AT_FDCWD, "/etc/ld.so.cache", O_RDONLY|O_CLOEXEC) = 3
+55    openat(AT_FDCWD, "/lib/x86_64-linux-gnu/libc.so.6", O_RDONLY|O_CLOEXEC) = 3
+55    execve("/usr/local/sbin/ls", ["ls", "-la", "labdata"], 0x55e7f60e7400 /* 11 vars */) = -1 ENOENT (No such file or directory)
+55    execve("/usr/local/bin/ls", ["ls", "-la", "labdata"], 0x55e7f60e7400 /* 11 vars */) = -1 ENOENT (No such file or directory)
+55    execve("/usr/sbin/ls", ["ls", "-la", "labdata"], 0x55e7f60e7400 /* 11 vars */) = -1 ENOENT (No such file or directory)
+55    execve("/usr/bin/ls", ["ls", "-la", "labdata"], 0x55e7f60e7400 /* 11 vars */) = 0
+55    openat(AT_FDCWD, "./libhide.so", O_RDONLY|O_CLOEXEC) = 3
+55    openat(AT_FDCWD, "/etc/ld.so.cache", O_RDONLY|O_CLOEXEC) = 3
+55    openat(AT_FDCWD, "/lib/x86_64-linux-gnu/libselinux.so.1", O_RDONLY|O_CLOEXEC) = 3
+55    openat(AT_FDCWD, "/lib/x86_64-linux-gnu/libc.so.6", O_RDONLY|O_CLOEXEC) = 3
+55    openat(AT_FDCWD, "/lib/x86_64-linux-gnu/libpcre2-8.so.0", O_RDONLY|O_CLOEXEC) = 3
+55    openat(AT_FDCWD, "/proc/filesystems", O_RDONLY|O_CLOEXEC) = 3
+55    openat(AT_FDCWD, "/etc/nsswitch.conf", O_RDONLY|O_CLOEXEC) = 3
+55    openat(AT_FDCWD, "/etc/passwd", O_RDONLY|O_CLOEXEC) = 3
+55    openat(AT_FDCWD, "/etc/group", O_RDONLY|O_CLOEXEC) = 3
+55    openat(AT_FDCWD, "labdata", O_RDONLY|O_NONBLOCK|O_CLOEXEC|O_DIRECTORY) = 3
+55    openat(AT_FDCWD, "/etc/localtime", O_RDONLY|O_CLOEXEC) = -1 ENOENT (No such file or directory)
+55    +++ exited with 0 +++

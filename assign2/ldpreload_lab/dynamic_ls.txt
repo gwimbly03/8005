@@ -1,0 +1,6 @@
+total 8
+drwxr-xr-x 1 root root  92 Sep 23 23:55 .
+drwxr-xr-x 1 root root 170 Sep 29 05:40 ..
+-rw-r--r-- 1 root root   0 Sep 23 23:55 .hidden_public
+-rw-r--r-- 1 root root   7 Sep 23 23:55 secret.txt
+-rw-r--r-- 1 root root   8 Sep 23 23:55 visible.txt
