@@ -1,9 +1,9 @@
-#!/usr/bin/env python3
 import argparse
 import json
 import socket
 import threading
 import time
+import os
 
 work_lock = threading.Lock()
 
@@ -13,6 +13,9 @@ node_work = {}           # node_id -> (start, end)
 password_found = False
 
 
+# -----------------------------------------------------------
+# JSON Communication
+# -----------------------------------------------------------
 def send_json(conn, data):
     conn.sendall((json.dumps(data) + "\n").encode())
 
@@ -24,7 +27,37 @@ def receive_json(conn):
     return json.loads(line)
 
 
-def handle_node(conn, addr, args):
+# -----------------------------------------------------------
+# HASH / SHADOW FILE HANDLING
+# -----------------------------------------------------------
+def load_hash_or_shadow(arg):
+    """
+    If --hash argument is a file, treat it as a shadow file.
+    Otherwise, treat it as a single hash string.
+    Returns a list of hashes.
+    """
+    if os.path.isfile(arg):
+        print(f"[*] Detected shadow file: {arg}")
+        hashes = []
+        with open(arg, "r") as f:
+            for line in f:
+                parts = line.strip().split(":")
+                if len(parts) >= 2:
+                    h = parts[1]
+                    if h not in ("", "*", "!"):
+                        hashes.append(h)
+        print(f"[*] Loaded {len(hashes)} hashes from shadow file")
+        return hashes
+
+    # Otherwise treat arg as a plain hash string
+    print("[*] Using single hash mode")
+    return [arg]
+
+
+# -----------------------------------------------------------
+# NODE HANDLER THREAD
+# -----------------------------------------------------------
+def handle_node(conn, addr, args, hashes):
     global password_found
 
     node_id = f"{addr[0]}:{addr[1]}"
@@ -44,6 +77,7 @@ def handle_node(conn, addr, args):
 
             mtype = msg["type"]
 
+            # Worker requests work
             if mtype == "work_request":
                 with work_lock:
                     if password_found:
@@ -57,25 +91,27 @@ def handle_node(conn, addr, args):
                     start, end = work_queue.pop(0)
                     node_work[node_id] = (start, end)
 
+                # Send work + ALL hashes (even if only one)
                 send_json(conn, {
                     "type": "work",
                     "start": start,
                     "end": end,
-                    "hash": args.hash,
+                    "hash": hashes,          # NOW A LIST
                     "checkpoint": args.checkpoint
                 })
 
+            # Worker heartbeat / checkpoint
             elif mtype == "checkpoint":
                 with work_lock:
                     active_nodes[node_id] = time.time()
-                # No response needed
+                # No reply needed
 
+            # Worker found the password
             elif mtype == "found":
                 print(f"[!!!] PASSWORD FOUND by {node_id}: {msg['password']}")
                 with work_lock:
                     password_found = True
 
-                # Tell ALL nodes to stop
                 send_json(conn, {"type": "ack"})
                 break
 
@@ -96,6 +132,9 @@ def handle_node(conn, addr, args):
         print(f"[X] Node connection closed: {node_id}")
 
 
+# -----------------------------------------------------------
+# TIMEOUT MONITOR THREAD
+# -----------------------------------------------------------
 def timeout_monitor(args):
     global password_found
 
@@ -118,18 +157,24 @@ def timeout_monitor(args):
                 del active_nodes[node_id]
 
 
+# -----------------------------------------------------------
+# MAIN
+# -----------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, required=True)
-    parser.add_argument("--hash", required=True)
+    parser.add_argument("--hash", required=True)  # unchanged, now supports file OR hash
     parser.add_argument("--work-size", type=int, required=True)
     parser.add_argument("--checkpoint", type=int, required=True)
     parser.add_argument("--timeout", type=int, required=True)
     args = parser.parse_args()
 
-    # Initialize brute-force search space: range 0 -> 26^5 or however large
+    # Load either single hash OR entire shadow file
+    hashes = load_hash_or_shadow(args.hash)
+
+    # Initialize brute-force search space
     print("[*] Generating work segments...")
-    MAX = 26 ** 5  # You can change this
+    MAX = 26 ** 5
     for i in range(0, MAX, args.work_size):
         work_queue.append((i, min(i + args.work_size, MAX)))
 
@@ -143,11 +188,15 @@ def main():
     server.bind(("0.0.0.0", args.port))
     server.listen()
 
-    print(f"[SERVER] Running on port {args.port}")
+    print(f"Running on port {args.port}")
 
     while True:
         conn, addr = server.accept()
-        threading.Thread(target=handle_node, args=(conn, addr, args), daemon=True).start()
+        threading.Thread(
+            target=handle_node,
+            args=(conn, addr, args, hashes),
+            daemon=True
+        ).start()
 
 
 if __name__ == "__main__":

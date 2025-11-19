@@ -3,8 +3,8 @@ import argparse
 import socket
 import json
 import multiprocessing as mp
-import time
 import threading
+import time
 import sys
 import crypt_r
 from passlib.context import CryptContext
@@ -15,6 +15,8 @@ from passlib.context import CryptContext
 LEGALCHAR = (
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789@#%^&*()_+-=.,:;?"
 )
+
+CALLBACK_PORT = 6000   # <----- HARD‑CODED CALLBACK PORT
 
 ctx = CryptContext(
     schemes=["bcrypt", "sha512_crypt", "sha256_crypt", "md5_crypt"],
@@ -55,49 +57,38 @@ def verify_hash(hash_field, password_guess):
 # -------------------------
 # WORKER PROCESS
 # -------------------------
-def worker_process(start, end, length, hash_field, checkpoint_interval,
+def worker_process(start, end, length, hash_list, checkpoint_interval,
                    stop_flag, found_password, progress_counter, report_queue):
-    """
-    Each process brute-forces its assigned chunk.
-    Sends checkpoint updates every N attempts.
-    """
 
     for i in range(start, end):
-        # Check global stop flag
         if stop_flag.value == 1:
             return
 
         password_guess = idx_to_guess(i, length)
 
-        if verify_hash(hash_field, password_guess):
-            with found_password.get_lock():
-                found_password.value = 1
-            report_queue.put({
-                "type": "FOUND",
-                "password": password_guess
-            })
-            return
+        for h in hash_list:
+            if verify_hash(h, password_guess):
+                with found_password.get_lock():
+                    found_password.value = 1
+                report_queue.put({"type": "found", "password": password_guess})
+                return
 
-        # checkpoint update
+        # checkpoint
         with progress_counter.get_lock():
             progress_counter.value += 1
             if progress_counter.value % checkpoint_interval == 0:
                 report_queue.put({
-                    "type": "CHECKPOINT",
+                    "type": "checkpoint",
                     "attempts": progress_counter.value,
                     "last_index": i
                 })
 
 
 # -------------------------
-# NETWORK THREAD
+# NETWORK SENDER THREAD
 # -------------------------
-def network_thread(sock, report_queue, stop_flag):
-    """
-    Continuously sends updates (CHECKPOINT, FOUND) to server.
-    Receives STOP or NEW WORK from server.
-    """
-
+def send_updates(sock, report_queue, stop_flag):
+    """ Sends checkpoint/found messages back to the server. """
     while True:
         if stop_flag.value == 1:
             return
@@ -115,91 +106,120 @@ def network_thread(sock, report_queue, stop_flag):
 
 
 # -------------------------
-# MAIN CLIENT LOGIC
+# MAIN NODE FUNCTION
 # -------------------------
 def main():
     parser = argparse.ArgumentParser(description="Distributed Worker Node")
-    parser.add_argument("--server", required=True, help="Server IP")
-    parser.add_argument("--port", required=True, type=int, help="Server port")
-    parser.add_argument("--threads", required=True, type=int, help="Worker processes")
-
+    parser.add_argument("--server", required=True)
+    parser.add_argument("--port", required=True, type=int)
+    parser.add_argument("--threads", required=True, type=int)
     args = parser.parse_args()
 
-    # Connect to server
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.connect((args.server, args.port))
+    # -----------------------------------------
+    # 1. Listen for callback from server
+    # -----------------------------------------
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("0.0.0.0", CALLBACK_PORT))
+    listener.listen(1)
 
-    # Register
-    sock.sendall(json.dumps({"type": "REGISTER"}) .encode() + b"\n")
+    print(f"[NODE] Listening for server callback on port {CALLBACK_PORT}")
 
-    # Main loop waiting for assignments
+    # -----------------------------------------
+    # 2. Connect to server and register
+    # -----------------------------------------
+    server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_sock.connect((args.server, args.port))
+
+    reg_msg = {
+        "type": "register",
+        "callback_port": CALLBACK_PORT
+    }
+    server_sock.sendall((json.dumps(reg_msg) + "\n").encode())
+
+    print("[NODE] Registered with server, waiting for callback connection...")
+
+    # -----------------------------------------
+    # 3. Wait for server to connect back
+    # -----------------------------------------
+    callback_conn, callback_addr = listener.accept()
+    print(f"[NODE] Server callback connection established from {callback_addr}")
+
     buffer = ""
 
     while True:
-        data = sock.recv(4096)
+        # Ask for work
+        callback_conn.sendall(json.dumps({"type": "work_request"}).encode() + b"\n")
+
+        data = callback_conn.recv(4096)
         if not data:
-            print("Disconnected from server.")
+            print("[NODE] Server disconnected.")
             return
 
         buffer += data.decode()
+
+        # process all messages
         while "\n" in buffer:
             line, buffer = buffer.split("\n", 1)
-
             if not line.strip():
                 continue
 
             msg = json.loads(line)
+            mtype = msg.get("type")
 
-            if msg["type"] == "ASSIGN_WORK":
-                # Extract work
+            if mtype == "no_work":
+                print("[NODE] No work available. Will ask again.")
+                time.sleep(1)
+                continue
+
+            if mtype == "cancel":
+                print("[NODE] Cancel received. Stopping.")
+                return
+
+            if mtype == "work":
                 start = msg["start"]
                 end = msg["end"]
-                length = msg["length"]
+                hash_list = msg["hash"]      # list from the server
                 checkpoint = msg["checkpoint"]
-                hash_field = msg["hash"]
 
-                # Shared state
+                print(f"[NODE] Received work: {start} → {end}")
+
+                # multiprocess states
                 stop_flag = mp.Value('i', 0)
                 found_password = mp.Value('i', 0)
                 progress_counter = mp.Value('i', 0)
-
                 report_queue = mp.Queue()
 
-                # Launch worker processes
+                # Launch workers
                 procs = []
-                chunk_size = (end - start) // args.threads
+                chunk = (end - start) // args.threads
                 for t in range(args.threads):
-                    s = start + t * chunk_size
-                    e = start + (t + 1) * chunk_size if t < args.threads - 1 else end
+                    s = start + t * chunk
+                    e = start + (t + 1) * chunk if t < args.threads - 1 else end
 
                     p = mp.Process(
                         target=worker_process,
-                        args=(s, e, length, hash_field, checkpoint,
+                        args=(s, e, 5, hash_list, checkpoint,
                               stop_flag, found_password, progress_counter, report_queue)
                     )
                     procs.append(p)
                     p.start()
 
-                # Start network thread
-                nt = threading.Thread(target=network_thread,
-                                      args=(sock, report_queue, stop_flag),
-                                      daemon=True)
-                nt.start()
+                # network sender
+                net_thread = threading.Thread(target=send_updates,
+                                              args=(callback_conn, report_queue, stop_flag),
+                                              daemon=True)
+                net_thread.start()
 
-                # Wait for processes
+                # wait for workers
                 for p in procs:
                     p.join()
 
-                # If we found the password, wait for server to confirm STOP
                 if found_password.value == 1:
+                    # send FOUND confirmation ends loop; server stops everyone
                     continue
 
-                # Otherwise, notify server finished work
-                sock.sendall(json.dumps({"type": "DONE"}).encode() + b"\n")
-
-            elif msg["type"] == "STOP":
-                print("Received STOP from server.")
-                return
+                # Work completed, request more
+                continue
 
 
 if __name__ == "__main__":
