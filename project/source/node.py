@@ -6,11 +6,10 @@ import threading
 import time
 import signal
 import sys
-
 import crypt_r
 from passlib.context import CryptContext
 
-# ====================== UNCHANGED CRACKING LOGIC ======================
+# ====================== CRACKING LOGIC (ONLY ON NODE) ======================
 LEGALCHAR = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789@#%^&*()_+-=.,:;?"
 BASE = len(LEGALCHAR)
 
@@ -21,33 +20,33 @@ ctx = CryptContext(
 
 def idx_to_guess(i: int, length: int) -> str:
     chars = []
+    idx = i
     for _ in range(length):
-        chars.append(LEGALCHAR[i % BASE])
-        i //= BASE
+        chars.append(LEGALCHAR[idx % BASE])
+        idx //= BASE
     return "".join(reversed(chars))
 
 def verify_hash(hash_field: str, password_guess: str) -> bool:
-    if hash_field.startswith("$y$"):
+    if hash_field.startswith("$y$"):  # yescrypt
         try:
             out = crypt_r.crypt(password_guess, hash_field)
             return out == hash_field
-        except Exception:
+        except:
             return False
     else:
         try:
             return ctx.verify(password_guess, hash_field)
-        except Exception:
+        except:
             return False
-# =====================================================================
+# ==========================================================================
 
 class WorkerNode:
     def __init__(self, server_ip: str, port: int, threads: int):
         self.server_ip = server_ip
         self.port = port
         self.threads = threads
-        self.hash = None
+        self.current_target = None
         self.stop_event = threading.Event()
-        self.current_jobs = []  # list of active cracking jobs
 
     def connect(self):
         while not self.stop_event.is_set():
@@ -56,11 +55,11 @@ class WorkerNode:
                 sock.connect((self.server_ip, self.port))
                 self.sock = sock
                 self.send({"type": "register"})
-                print(f"[+] Connected to server {self.server_ip}:{self.port}")
+                print(f"[+] Connected to {self.server_ip}:{self.port}")
                 self.receive_loop()
                 return
             except Exception as e:
-                print(f"[-] Connection failed ({e}), retrying in 5s...")
+                print(f"[-] Connection failed: {e} – retrying in 5s")
                 time.sleep(5)
 
     def send(self, msg: dict):
@@ -89,51 +88,55 @@ class WorkerNode:
 
     def handle(self, msg: dict):
         tp = msg["type"]
-
-        if tp == "hash":
-            self.hash = msg["hash"]
-            print(f"[i] Received target hash")
-
-        elif tp == "work":
-            if not self.hash:
-                return
-            job = {
-                "length": msg["length"],
-                "start": msg["start_idx"],
-                "end": msg["end_idx"],
-                "interval": msg["checkpoint_interval"],
+        if tp == "new_target":
+            self.current_target = {
+                "username": msg["username"],
+                "hash": msg["hash"],
+                "interval": msg["checkpoint_interval"]
             }
+            print(f"[+] Cracking user: {msg['username']}")
             for _ in range(self.threads):
-                t = threading.Thread(target=self.crack_thread, args=(job,), daemon=True)
+                t = threading.Thread(target=self.crack_target, daemon=True)
                 t.start()
-                self.current_jobs.append(t)
 
         elif tp == "stop":
             print("[i] Stop signal received")
             self.stop_event.set()
 
-    def crack_thread(self, job: dict):
-        i = job["start"]
-        end = job["end"]
-        length = job["length"]
-        interval = job["interval"]
-        next_cp = i + interval
+    def crack_target(self):
+        target = self.current_target
+        if not target:
+            return
 
-        while i < end and not self.stop_event.is_set():
-            guess = idx_to_guess(i, length)
-            if verify_hash(self.hash, guess):
-                print(f"\n*** FOUND: {guess} ***")
-                self.send({"type": "found", "password": guess})
-                self.stop_event.set()
-                return
+        username = target["username"]
+        h = target["hash"]
+        interval = target["interval"]
 
-            if i >= next_cp:
-                self.send({"type": "checkpoint", "idx": i})
-                next_cp += interval
-            i += 1
+        length = 1
+        while not self.stop_event.is_set():
+            total = BASE ** length
+            i = 0
+            next_cp = interval
 
-        # finished without finding
-        self.send({"type": "checkpoint", "idx": end})
+            while i < total and not self.stop_event.is_set():
+                guess = idx_to_guess(i, length)
+                if verify_hash(h, guess):
+                    print(f"\n*** PASSWORD FOUND for {username}: {guess} ***")
+                    self.send({"type": "found", "username": username, "password": guess})
+                    self.stop_event.set()
+                    return
+
+                if i >= next_cp:
+                    self.send({"type": "checkpoint", "username": username, "length": length, "idx": i})
+                    next_cp += interval
+                i += 1
+
+            print(f"[i] Finished length {length} for {username}")
+            length += 1
+            if length > 12:
+                break
+
+        self.send({"type": "checkpoint", "username": username, "length": length, "idx": 0})
 
     def run(self):
         while not self.stop_event.is_set():
@@ -141,13 +144,12 @@ class WorkerNode:
             time.sleep(5)
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Distributed Password Cracker - Worker Node")
-    parser.add_argument("--server", required=True, help="Server IP address")
-    parser.add_argument("--port", type=int, default=5000, help="Server port")
-    parser.add_argument("--threads", type=int, default=4, help="Number of cracking threads")
+    parser = argparse.ArgumentParser(description="Distributed Password Cracker – Node")
+    parser.add_argument("--server", required=True)
+    parser.add_argument("--port", type=int, default=5000)
+    parser.add_argument("--threads", type=int, default=4)
     args = parser.parse_args()
 
     signal.signal(signal.SIGINT, lambda s, f: sys.exit(0))
-
     node = WorkerNode(args.server, args.port, args.threads)
     node.run()

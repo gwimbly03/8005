@@ -7,254 +7,250 @@ import time
 import sys
 import signal
 import os
-from typing import Dict, Optional, List
+from typing import List, Tuple, Dict, Optional
 
+# Server only needs this to compute search space size
+LEGALCHAR = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789@#%^&*()_+-=.,:;?"
+BASE = len(LEGALCHAR)
 
-def find_hash_in_shadow(shadow_path: str, username: str) -> str:
-    with open(shadow_path, "r", encoding="utf-8", errors="ignore") as f:
-        for line in f:
-            if not line.strip() or line.startswith("#"):
-                continue
-            parts = line.rstrip("\n").split(":")
-            if len(parts) >= 2 and parts[0] == username:
-                return parts[1]
-    raise ValueError(f"User '{username}' not found in shadow file")
+found_event = threading.Event()
 
 class WorkUnit:
-    def __init__(self, length: int, start_idx: int, end_idx: int):
+    def __init__(self, username: str, hash_field: str, length: int, start_idx: int, end_idx: int):
+        self.username = username
+        self.hash_field = hash_field
         self.length = length
         self.start_idx = start_idx
         self.end_idx = end_idx
-        self.last_reported = start_idx  # last checkpoint received
+        self.last_checkpoint = start_idx  # where node last reported
 
 class Node:
-    def __init__(self, conn: socket.socket, addr, node_id: int):
+    def __init__(self, conn: socket.socket, addr: tuple, node_id: int):
         self.conn = conn
         self.addr = addr
         self.id = node_id
-        self.work: Optional[WorkUnit] = None
+        self.current_work: Optional[WorkUnit] = None
         self.alive = True
         self.last_seen = time.time()
-        self.thread = threading.Thread(target=self.handle, daemon=True)
+        self.thread = threading.Thread(target=self.handle_connection, daemon=True)
         self.thread.start()
 
     def send(self, msg: dict):
         try:
             data = json.dumps(msg).encode("utf-8") + b"\n"
             self.conn.sendall(data)
-        except Exception:
+        except:
             self.alive = False
 
-    def handle(self):
-        buf = b""
+    def handle_connection(self):
+        buffer = b""
         while self.alive:
             try:
                 data = self.conn.recv(4096)
                 if not data:
                     break
-                buf += data
-                while b"\n" in buf:
-                    line, buf = buf.split(b"\n", 1)
-                    if line:
-                        msg = json.loads(line.decode("utf-8"))
-                        self.process_message(msg)
-            except Exception:
+                buffer += data
+                while b"\n" in buffer:
+                    line, buffer = buffer.split(b"\n", 1)
+                    if line.strip():
+                        msg = json.loads(line)
+                        server.handle_message(self, msg)
+            except:
                 break
         self.alive = False
-        server.on_node_disconnect(self)
-
-    def process_message(self, msg: dict):
-        global found_password, found_event
-
-        if msg["type"] == "register":
-            print(f"[+] Node #{self.id} registered from {self.addr[0]}:{self.addr[1]}")
-            self.send({"type": "hash", "hash": target_hash})
-
-        elif msg["type"] == "checkpoint":
-            idx = msg["idx"]
-            self.work.last_reported = idx
-            self.last_seen = time.time()
-            print(f"[*] Node #{self.id} checkpoint: length={self.work.length} idx={idx:,}")
-
-        elif msg["type"] == "found":
-            pw = msg["password"]
-            print("\n" + "="*70)
-            print(f"PASSWORD CRACKED BY NODE #{self.id}: {pw}")
-            print("="*70)
-            found_password = pw
-            found_event.set()
-            server.broadcast_stop()
+        server.node_disconnected(self)
 
 class Server:
-    def __init__(self, args):
+    def __init__(self, users: List[Tuple[str, str]], args):
+        self.users = users[:]  # copy list of (username, hash)
         self.args = args
         self.nodes: List[Node] = []
-        self.node_counter = 0
-        self.lock = threading.Lock()
-        self.current_length = 1
+        self.node_id_counter = 0
         self.pending_work: List[WorkUnit] = []
-        self.assigned: Dict[Node, WorkUnit] = {}
+        self.assigned_work: Dict[Node, WorkUnit] = {}
+        self.lock = threading.Lock()
 
-    def broadcast_stop(self):
-        msg = {"type": "stop"}
-        for node in list(self.nodes):
-            if node.alive:
-                node.send(msg)
+    def load_all_users(self):
+        print(f"[*] Loaded {len(self.users)} crackable account(s):")
+        for username, h in self.users:
+            alg = h.split("$")[1] if "$" in h else "unknown"
+            print(f"    → {username:15} {h[:40]}... ({alg})")
 
-    def on_node_disconnect(self, node: Node):
-        with self.lock:
-            if not node.alive:
-                return
-            node.alive = False
-            print(f"[-] Node #{node.id} disconnected ({node.addr})")
-            if node in self.assigned:
-                work = self.assigned.pop(node)
-                remaining_start = work.last_reported
-                if remaining_start < work.end_idx:
-                    new_unit = WorkUnit(work.length, remaining_start, work.end_idx)
-                    self.pending_work.append(new_unit)
-                    print(f"[i] Requeued unfinished work: len={work.length} [{remaining_start:,}..{work.end_idx:,})")
-            self.nodes = [n for n in self.nodes if n.alive]
+    def generate_work_for_user(self, username: str, hash_field: str, length: int):
+        total = BASE ** length
+        chunk = self.args.work_size
+        for start in range(0, total, chunk):
+            end = min(start + chunk, total)
+            self.pending_work.append(WorkUnit(username, hash_field, length, start, end))
 
-    def health_check(self):
-        while True:
-            time.sleep(5)
-            now = time.time()
-            with self.lock:
-                for node in list(self.nodes):
-                    if node.alive and now - node.last_seen > self.args.timeout:
-                        print(f"[!] Node #{node.id} timed out (no checkpoint for {self.args.timeout}s)")
-                        node.conn.close()  # trigger disconnect handling
+    def generate_next_length(self):
+        current_length = 1
+        user_index = 0
+
+        while not found_event.is_set() and user_index < len(self.users):
+            username, hash_field = self.users[user_index]
+
+            # Generate all chunks for this length for this user
+            self.generate_work_for_user(username, hash_field, current_length)
+            print(f"[+] Prepared length {current_length} for {username} → {BASE**current_length:,} passwords")
+
+            # Wait until all chunks of this length for this user are done or password found
+            while not found_event.is_set():
+                with self.lock:
+                    remaining = [w for w in self.pending_work if w.username == username and w.length == current_length]
+                    assigned_here = [w for w in self.assigned_work.values() if w.username == username and w.length == current_length]
+                if not remaining and not assigned_here:
+                    break
+                time.sleep(1)
+
+            current_length += 1
+            if current_length > 12:
+                print(f"[!] {username} reached max length, moving to next user")
+                user_index += 1
+                current_length = 1
+
+        if not found_event.is_set():
+            print("[!] All users exhausted — no password found")
 
     def assign_work(self):
         while not found_event.is_set():
+            time.sleep(0.2)
             with self.lock:
-                idle_nodes = [n for n in self.nodes if n.alive and n.work is None]
+                idle_nodes = [n for n in self.nodes if n.alive and n.current_work is None]
                 if not idle_nodes or not self.pending_work:
-                    time.sleep(0.1)
                     continue
                 node = idle_nodes[0]
                 work = self.pending_work.pop(0)
-            node.work = work
-            self.assigned[node] = work
+                node.current_work = work
+                self.assigned_work[node] = work
 
             msg = {
                 "type": "work",
+                "username": work.username,
+                "hash": work.hash_field,
                 "length": work.length,
                 "start_idx": work.start_idx,
                 "end_idx": work.end_idx,
                 "checkpoint_interval": self.args.checkpoint
             }
-            print(f"--> Node #{node.id}: len={work.length} [{work.start_idx:,}..{work.end_idx:,})")
+            print(f"--> Node #{node.id} → {work.username} len={work.length} [{work.start_idx:,}..{work.end_idx:,})")
             node.send(msg)
 
-    def generate_work_for_length(self, length: int):
-        total = BASE ** length
-        start = 0
-        while start < total:
-            end = min(start + self.args.work_size, total)
-            self.pending_work.append(WorkUnit(length, start, end))
-            start = end
-        print(f"[+] Prepared length {length}: {total:,} passwords → {len(self.pending_work)} chunks")
+    def handle_message(self, node: Node, msg: dict):
+        global found_event
+        t = msg["type"]
 
-    def work_generator(self):
+        if t == "register":
+            print(f"[+] Node #{node.id} registered from {node.addr[0]}:{node.addr[1]}")
+            node.last_seen = time.time()
+
+        elif t == "checkpoint":
+            idx = msg["idx"]
+            node.last_seen = time.time()
+            if node.current_work:
+                node.current_work.last_checkpoint = idx
+            print(f"[*] Checkpoint Node #{node.id} → {msg['username']} len={msg['length']} idx={idx:,}")
+
+        elif t == "found":
+            print("\n" + "="*80)
+            print(f"PASSWORD FOUND BY NODE #{node.id}!")
+            print(f"Username : {msg['username']}")
+            print(f"Password : {msg['password']}")
+            print("="*80)
+            found_event.set()
+            self.broadcast_stop()
+
+    def node_disconnected(self, node: Node):
+        with self.lock:
+            if not node.alive:
+                return
+            node.alive = False
+            print(f"[-] Node #{node.id} disconnected")
+            if node in self.assigned_work:
+                work = self.assigned_work.pop(node)
+                if work.last_checkpoint < work.end_idx:
+                    remaining = WorkUnit(
+                        work.username, work.hash_field, work.length,
+                        work.last_checkpoint, work.end_idx
+                    )
+                    self.pending_work.append(remaining)
+                    print(f"[i] Re-queued partial work for {work.username} [{work.last_checkpoint:,}..{work.end_idx:,})")
+            self.nodes = [n for n in self.nodes if n.alive]
+
+    def health_check(self):
         while not found_event.is_set():
-            self.generate_work_for_length(self.current_length)
-            # wait until this length is done
-            while self.pending_work or any(n.work and n.work.length == self.current_length for n in self.nodes):
-                if found_event.is_set():
-                    return
-                time.sleep(1)
-            self.current_length += 1
-            if self.current_length > 12:
-                print("[!] Max length reached")
-                break
+            time.sleep(5)
+            now = time.time()
+            with self.lock:
+                for node in list(self.nodes):
+                    if node.alive and now - node.last_seen > self.args.timeout:
+                        print(f"[!] Node #{node.id} timeout ({self.args.timeout}s no checkpoint)")
+                        node.conn.close()
+
+    def broadcast_stop(self):
+        msg = {"type": "stop"}
+        for node in self.nodes:
+            if node.alive:
+                node.send(msg)
 
     def start(self):
+        self.load_all_users()
+        print(f"[*] Listening on 0.0.0.0:{self.args.port}")
+        print(f"    Work size: {self.args.work_size} | Checkpoint: {self.args.checkpoint} | Timeout: {self.args.timeout}s\n")
+
+        threading.Thread(target=self.generate_next_length, daemon=True).start()
+        threading.Thread(target=self.assign_work, daemon=True).start()
+        threading.Thread(target=self.health_check, daemon=True).start()
+
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind(("0.0.0.0", self.args.port))
         sock.listen(50)
-        print(f"[*] Server listening on port {self.args.port}")
-        print(f"    Work size: {self.args.work_size:,} | Checkpoint: {self.args.checkpoint} | Timeout: {self.args.timeout}s")
-
-        threading.Thread(target=self.assign_work, daemon=True).start()
-        threading.Thread(target=self.work_generator, daemon=True).start()
-        threading.Thread(target=self.health_check, daemon=True).start()
 
         while not found_event.is_set():
             try:
                 conn, addr = sock.accept()
                 with self.lock:
-                    node = Node(conn, addr, self.node_counter)
+                    node = Node(conn, addr, self.node_id_counter)
                     self.nodes.append(node)
-                    self.node_counter += 1
+                    self.node_id_counter += 1
             except OSError:
                 break
 
-# ========================== GLOBALS ==========================
-found_password: Optional[str] = None
-found_event = threading.Event()
-target_hash: str = ""
-server: Server
-
-def sigint_handler(sig, frame):
-    print("\n[!] Shutting down...")
-    found_event.set()
-    if 'server' in globals():
-        server.broadcast_stop()
-    sys.exit(0)
-
-if __name__ == "__main__":
-    signal.signal(signal.SIGINT, sigint_handler)
-
+# ==================== MAIN ====================
+def main():
     parser = argparse.ArgumentParser(description="Distributed Password Cracker - Server")
-    parser.add_argument("--port", type=int, default=5000, help="Port the server listens on")
-    parser.add_argument("--hash", required=True, help="Path to shadow file (cracks the first valid user automatically)")
-    parser.add_argument("--work-size", type=int, default=100_000, help="Passwords per work unit")
-    parser.add_argument("--checkpoint", type=int, default=5000, help="Node sends checkpoint after N guesses")
-    parser.add_argument("--timeout", type=int, default=60, help="Seconds to wait for checkpoint before considering node dead")
+    parser.add_argument("--port", type=int, default=9000)
+    parser.add_argument("--hash", required=True, help="Path to shadow file")
+    parser.add_argument("--work-size", type=int, default=100000, help="Guesses per work unit")
+    parser.add_argument("--checkpoint", type=int, default=5000, help="Checkpoint every N guesses")
+    parser.add_argument("--timeout", type=int, default=60, help="Node timeout in seconds")
     args = parser.parse_args()
 
-    # ============================== NEW HASH LOADING ==============================
-    shadow_path = args.hash.strip()
-
-    if not os.path.isfile(shadow_path):
-        print(f"[!] Shadow file not found: {shadow_path}")
+    if not os.path.isfile(args.hash):
+        print(f"[!] Shadow file not found: {args.hash}")
         sys.exit(1)
 
-    target_hash = None
-    target_username = None
-
-    with open(shadow_path, "r", encoding="utf-8", errors="ignore") as f:
+    users = []
+    with open(args.hash, "r", encoding="utf-8", errors="ignore") as f:
         for line in f:
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
-            parts = line.split(":")
-            if len(parts) < 2:
-                continue
-            username, hash_field = parts[0], parts[1]
+            parts = line.split(":", 2)
+            if len(parts) >= 2:
+                username, h = parts[0], parts[1]
+                if h.startswith("$") and not h.startswith("!"):
+                    users.append((username, h))
 
-            # Skip locked accounts, NP accounts, etc.
-            if hash_field in ("*", "!", "", "!!", "x") or hash_field.startswith("!"):
-                continue
-
-            # Very basic validity: must start with $ (all modern hashes do)
-            if not hash_field.startswith("$"):
-                continue
-
-            target_username = username
-            target_hash = hash_field
-            break  # Take the first valid one
-
-    if not target_hash:
-        print("[!] No crackable users found in the shadow file.")
+    if not users:
+        print("[!] No crackable hashes found")
         sys.exit(1)
 
-    print(f"[*] Target user (auto-selected): {target_username}")
-    print(f"[*] Hash: {target_hash}")
-    # ============================================================================
-
-    server = Server(args)
+    global server
+    server = Server(users, args)
     server.start()
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGINT, lambda s, f: sys.exit(0))
+    main()
