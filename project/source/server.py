@@ -6,40 +6,9 @@ import json
 import time
 import sys
 import signal
+import os
 from typing import Dict, Optional, List
 
-import crypt_r
-from passlib.context import CryptContext
-
-# ====================== UNCHANGED CRACKING LOGIC ======================
-LEGALCHAR = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789@#%^&*()_+-=.,:;?"
-BASE = len(LEGALCHAR)
-
-ctx = CryptContext(
-    schemes=["bcrypt", "sha512_crypt", "sha256_crypt", "md5_crypt"],
-    deprecated="auto",
-)
-
-def idx_to_guess(i: int, length: int) -> str:
-    chars = []
-    for _ in range(length):
-        chars.append(LEGALCHAR[i % BASE])
-        i //= BASE
-    return "".join(reversed(chars))
-
-def verify_hash(hash_field: str, password_guess: str) -> bool:
-    if hash_field.startswith("$y$"):  # yescrypt
-        try:
-            out = crypt_r.crypt(password_guess, hash_field)
-            return out == hash_field
-        except Exception:
-            return False
-    else:
-        try:
-            return ctx.verify(password_guess, hash_field)
-        except Exception:
-            return False
-# =====================================================================
 
 def find_hash_in_shadow(shadow_path: str, username: str) -> str:
     with open(shadow_path, "r", encoding="utf-8", errors="ignore") as f:
@@ -241,26 +210,51 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Distributed Password Cracker - Server")
     parser.add_argument("--port", type=int, default=5000, help="Port the server listens on")
-    parser.add_argument("--hash", required=True, help="Path to shadow file and username, e.g., '/etc/shadow alice'")
+    parser.add_argument("--hash", required=True, help="Path to shadow file (cracks the first valid user automatically)")
     parser.add_argument("--work-size", type=int, default=100_000, help="Passwords per work unit")
     parser.add_argument("--checkpoint", type=int, default=5000, help="Node sends checkpoint after N guesses")
     parser.add_argument("--timeout", type=int, default=60, help="Seconds to wait for checkpoint before considering node dead")
     args = parser.parse_args()
 
-    # Parse --hash "shadow_path username"
-    try:
-        shadow_path, username = args.hash.rsplit(maxsplit=1)
-    except ValueError:
-        print("Error: --hash must be 'shadow_file_path username'")
+    # ============================== NEW HASH LOADING ==============================
+    shadow_path = args.hash.strip()
+
+    if not os.path.isfile(shadow_path):
+        print(f"[!] Shadow file not found: {shadow_path}")
         sys.exit(1)
 
-    try:
-        target_hash = find_hash_in_shadow(shadow_path, username)
-        print(f"[*] Target user: {username}")
-        print(f"[*] Hash: {target_hash}")
-    except Exception as e:
-        print(e)
+    target_hash = None
+    target_username = None
+
+    with open(shadow_path, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split(":")
+            if len(parts) < 2:
+                continue
+            username, hash_field = parts[0], parts[1]
+
+            # Skip locked accounts, NP accounts, etc.
+            if hash_field in ("*", "!", "", "!!", "x") or hash_field.startswith("!"):
+                continue
+
+            # Very basic validity: must start with $ (all modern hashes do)
+            if not hash_field.startswith("$"):
+                continue
+
+            target_username = username
+            target_hash = hash_field
+            break  # Take the first valid one
+
+    if not target_hash:
+        print("[!] No crackable users found in the shadow file.")
         sys.exit(1)
+
+    print(f"[*] Target user (auto-selected): {target_username}")
+    print(f"[*] Hash: {target_hash}")
+    # ============================================================================
 
     server = Server(args)
     server.start()
