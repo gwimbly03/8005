@@ -1,202 +1,225 @@
+#!/usr/bin/env python3
 import argparse
-import json
 import socket
+import json
+import multiprocessing as mp
 import threading
 import time
-import os
+import sys
+import crypt_r
+from passlib.context import CryptContext
 
-work_lock = threading.Lock()
+# -------------------------
+# CONSTANTS
+# -------------------------
+LEGALCHAR = (
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789@#%^&*()_+-=.,:;?"
+)
 
-work_queue = []          # (start, end)
-active_nodes = {}        # node_id -> timestamp of last checkpoint
-node_work = {}           # node_id -> (start, end)
-password_found = False
+CALLBACK_PORT = 6000   # <----- HARD‑CODED CALLBACK PORT
 
-
-# -----------------------------------------------------------
-# JSON Communication
-# -----------------------------------------------------------
-def send_json(conn, data):
-    conn.sendall((json.dumps(data) + "\n").encode())
-
-
-def receive_json(conn):
-    line = conn.recv(4096).decode().strip()
-    if not line:
-        return None
-    return json.loads(line)
+ctx = CryptContext(
+    schemes=["bcrypt", "sha512_crypt", "sha256_crypt", "md5_crypt"],
+    deprecated="auto",
+)
+_crypt_lock = mp.Lock()
 
 
-# -----------------------------------------------------------
-# HASH / SHADOW FILE HANDLING
-# -----------------------------------------------------------
-def load_hash_or_shadow(arg):
-    """
-    If --hash argument is a file, treat it as a shadow file.
-    Otherwise, treat it as a single hash string.
-    Returns a list of hashes.
-    """
-    if os.path.isfile(arg):
-        print(f"[*] Detected shadow file: {arg}")
-        hashes = []
-        with open(arg, "r") as f:
-            for line in f:
-                parts = line.strip().split(":")
-                if len(parts) >= 2:
-                    h = parts[1]
-                    if h not in ("", "*", "!"):
-                        hashes.append(h)
-        print(f"[*] Loaded {len(hashes)} hashes from shadow file")
-        return hashes
-
-    # Otherwise treat arg as a plain hash string
-    print("[*] Using single hash mode")
-    return [arg]
+# -------------------------
+# HASH + BRUTE FORCE LOGIC
+# -------------------------
+def idx_to_guess(i, length):
+    base = len(LEGALCHAR)
+    chars = []
+    for _ in range(length):
+        chars.append(LEGALCHAR[i % base])
+        i //= base
+    return "".join(reversed(chars))
 
 
-# -----------------------------------------------------------
-# NODE HANDLER THREAD
-# -----------------------------------------------------------
-def handle_node(conn, addr, args, hashes):
-    global password_found
-
-    node_id = f"{addr[0]}:{addr[1]}"
-    print(f"[+] Node connected: {node_id}")
+def verify_hash(hash_field, password_guess):
+    if hash_field.startswith("$y$"):  # yescrypt
+        try:
+            with _crypt_lock:
+                out = crypt_r.crypt(password_guess, hash_field)
+        except Exception:
+            return False
+        if not out:
+            return False
+        return out == hash_field
 
     try:
-        # Register node
-        with work_lock:
-            active_nodes[node_id] = time.time()
+        return ctx.verify(password_guess, hash_field)
+    except Exception:
+        return False
 
-        # Main loop
-        while True:
-            msg = receive_json(conn)
-            if msg is None:
-                print(f"[!] Node disconnected: {node_id}")
-                break
 
-            mtype = msg["type"]
+# -------------------------
+# WORKER PROCESS
+# -------------------------
+def worker_process(start, end, length, hash_list, checkpoint_interval,
+                   stop_flag, found_password, progress_counter, report_queue):
 
-            # Worker requests work
-            if mtype == "work_request":
-                with work_lock:
-                    if password_found:
-                        send_json(conn, {"type": "cancel"})
-                        continue
+    for i in range(start, end):
+        if stop_flag.value == 1:
+            return
 
-                    if len(work_queue) == 0:
-                        send_json(conn, {"type": "no_work"})
-                        continue
+        password_guess = idx_to_guess(i, length)
 
-                    start, end = work_queue.pop(0)
-                    node_work[node_id] = (start, end)
+        for h in hash_list:
+            if verify_hash(h, password_guess):
+                with found_password.get_lock():
+                    found_password.value = 1
+                report_queue.put({"type": "found", "password": password_guess})
+                return
 
-                # Send work + ALL hashes (even if only one)
-                send_json(conn, {
-                    "type": "work",
-                    "start": start,
-                    "end": end,
-                    "hash": hashes,          # NOW A LIST
-                    "checkpoint": args.checkpoint
+        # checkpoint
+        with progress_counter.get_lock():
+            progress_counter.value += 1
+            if progress_counter.value % checkpoint_interval == 0:
+                report_queue.put({
+                    "type": "checkpoint",
+                    "attempts": progress_counter.value,
+                    "last_index": i
                 })
 
-            # Worker heartbeat / checkpoint
-            elif mtype == "checkpoint":
-                with work_lock:
-                    active_nodes[node_id] = time.time()
-                # No reply needed
 
-            # Worker found the password
-            elif mtype == "found":
-                print(f"[!!!] PASSWORD FOUND by {node_id}: {msg['password']}")
-                with work_lock:
-                    password_found = True
+# -------------------------
+# NETWORK SENDER THREAD
+# -------------------------
+def send_updates(sock, report_queue, stop_flag):
+    """ Sends checkpoint/found messages back to the server. """
+    while True:
+        if stop_flag.value == 1:
+            return
 
-                send_json(conn, {"type": "ack"})
-                break
+        try:
+            msg = report_queue.get(timeout=0.1)
+        except:
+            continue
 
-    except Exception as e:
-        print(f"[ERROR] Node {node_id} crashed: {e}")
-
-    finally:
-        # Cleanup and return unfinished work
-        with work_lock:
-            if node_id in node_work:
-                print(f"[!] Reclaiming unfinished work from {node_id}")
-                work_queue.append(node_work[node_id])
-                del node_work[node_id]
-            if node_id in active_nodes:
-                del active_nodes[node_id]
-
-        conn.close()
-        print(f"[X] Node connection closed: {node_id}")
+        try:
+            sock.sendall((json.dumps(msg) + "\n").encode())
+        except:
+            stop_flag.value = 1
+            return
 
 
-# -----------------------------------------------------------
-# TIMEOUT MONITOR THREAD
-# -----------------------------------------------------------
-def timeout_monitor(args):
-    global password_found
-
-    while not password_found:
-        time.sleep(2)
-        now = time.time()
-
-        with work_lock:
-            dead_nodes = []
-            for node_id, last in active_nodes.items():
-                if now - last > args.timeout:
-                    print(f"[TIMEOUT] Node died: {node_id}")
-                    dead_nodes.append(node_id)
-
-            for node_id in dead_nodes:
-                if node_id in node_work:
-                    print(f"[!] Returning unfinished work from {node_id}")
-                    work_queue.append(node_work[node_id])
-                    del node_work[node_id]
-                del active_nodes[node_id]
-
-
-# -----------------------------------------------------------
-# MAIN
-# -----------------------------------------------------------
+# -------------------------
+# MAIN NODE FUNCTION
+# -------------------------
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--port", type=int, required=True)
-    parser.add_argument("--hash", required=True)  # unchanged, now supports file OR hash
-    parser.add_argument("--work-size", type=int, required=True)
-    parser.add_argument("--checkpoint", type=int, required=True)
-    parser.add_argument("--timeout", type=int, required=True)
+    parser = argparse.ArgumentParser(description="Distributed Worker Node")
+    parser.add_argument("--server", required=True)
+    parser.add_argument("--port", required=True, type=int)
+    parser.add_argument("--threads", required=True, type=int)
     args = parser.parse_args()
 
-    # Load either single hash OR entire shadow file
-    hashes = load_hash_or_shadow(args.hash)
+    # -----------------------------------------
+    # 1. Listen for callback from server
+    # -----------------------------------------
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("0.0.0.0", CALLBACK_PORT))
+    listener.listen(1)
 
-    # Initialize brute-force search space
-    print("[*] Generating work segments...")
-    MAX = 26 ** 5
-    for i in range(0, MAX, args.work_size):
-        work_queue.append((i, min(i + args.work_size, MAX)))
+    print(f"[NODE] Listening for server callback on port {CALLBACK_PORT}")
 
-    print(f"[*] Total work segments: {len(work_queue)}")
+    # -----------------------------------------
+    # 2. Connect to server and register
+    # -----------------------------------------
+    server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_sock.connect((args.server, args.port))
 
-    # Start timeout monitor
-    threading.Thread(target=timeout_monitor, args=(args,), daemon=True).start()
+    reg_msg = {
+        "type": "register",
+        "callback_port": CALLBACK_PORT
+    }
+    server_sock.sendall((json.dumps(reg_msg) + "\n").encode())
 
-    # Start server
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.bind(("0.0.0.0", args.port))
-    server.listen()
+    print("[NODE] Registered with server, waiting for callback connection...")
 
-    print(f"Running on port {args.port}")
+    # -----------------------------------------
+    # 3. Wait for server to connect back
+    # -----------------------------------------
+    callback_conn, callback_addr = listener.accept()
+    print(f"[NODE] Server callback connection established from {callback_addr}")
+
+    buffer = ""
 
     while True:
-        conn, addr = server.accept()
-        threading.Thread(
-            target=handle_node,
-            args=(conn, addr, args, hashes),
-            daemon=True
-        ).start()
+        # Ask for work
+        callback_conn.sendall(json.dumps({"type": "work_request"}).encode() + b"\n")
+
+        data = callback_conn.recv(4096)
+        if not data:
+            print("[NODE] Server disconnected.")
+            return
+
+        buffer += data.decode()
+
+        # process all messages
+        while "\n" in buffer:
+            line, buffer = buffer.split("\n", 1)
+            if not line.strip():
+                continue
+
+            msg = json.loads(line)
+            mtype = msg.get("type")
+
+            if mtype == "no_work":
+                print("[NODE] No work available. Will ask again.")
+                time.sleep(1)
+                continue
+
+            if mtype == "cancel":
+                print("[NODE] Cancel received. Stopping.")
+                return
+
+            if mtype == "work":
+                start = msg["start"]
+                end = msg["end"]
+                hash_list = msg["hash"]      # list from the server
+                checkpoint = msg["checkpoint"]
+
+                print(f"[NODE] Received work: {start} → {end}")
+
+                # multiprocess states
+                stop_flag = mp.Value('i', 0)
+                found_password = mp.Value('i', 0)
+                progress_counter = mp.Value('i', 0)
+                report_queue = mp.Queue()
+
+                # Launch workers
+                procs = []
+                chunk = (end - start) // args.threads
+                for t in range(args.threads):
+                    s = start + t * chunk
+                    e = start + (t + 1) * chunk if t < args.threads - 1 else end
+
+                    p = mp.Process(
+                        target=worker_process,
+                        args=(s, e, 5, hash_list, checkpoint,
+                              stop_flag, found_password, progress_counter, report_queue)
+                    )
+                    procs.append(p)
+                    p.start()
+
+                # network sender
+                net_thread = threading.Thread(target=send_updates,
+                                              args=(callback_conn, report_queue, stop_flag),
+                                              daemon=True)
+                net_thread.start()
+
+                # wait for workers
+                for p in procs:
+                    p.join()
+
+                if found_password.value == 1:
+                    # send FOUND confirmation ends loop; server stops everyone
+                    continue
+
+                # Work completed, request more
+                continue
 
 
 if __name__ == "__main__":
