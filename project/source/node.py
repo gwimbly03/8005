@@ -13,25 +13,48 @@ import time
 import sys
 import os
 
-# ensure cracker.py is importable; path where you uploaded cracker.py
-CRACKER_PATH = "/mnt/data"   # <--- if you run node elsewhere, update/copy cracker.py accordingly
-if CRACKER_PATH not in sys.path:
-    sys.path.insert(0, CRACKER_PATH)
+CHAR = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789@#%^&*()_+-=.,:;?"
+BASE = len(CHAR)
 
+from passlib.context import CryptContext
 try:
-    import cracker
-except Exception as e:
-    print(f"[!] Cannot import cracker module from {CRACKER_PATH}: {e}")
-    raise
+    import crypt_r
+except Exception:
+    crypt_r = None
 
-# expose aliases (easier usage in code)
-idx_to_guess = cracker.idx_to_guess
-verify_hash = cracker.verify_hash
-CHAR = cracker.CHAR if hasattr(cracker, "CHAR") else (getattr(cracker, "CHAR", None) or getattr(cracker, "CHARACTER", None) or None)
-# NOTE: cracker.py in your upload uses "CHAR" variable name; if different adjust above.
+CTX = CryptContext(
+    schemes=["bcrypt", "sha512_crypt", "sha256_crypt", "md5_crypt"],
+    deprecated="auto",
+)
 
-def debug(msg):
-    print(f"[DEBUG] {msg}", flush=True)
+def idx_to_guess(i, length):
+    base = len(CHAR)
+    chars = []
+    for _ in range(length):
+        chars.append(CHAR[i % base])
+        i //= base
+    return "".join(reversed(chars))
+
+def verify_hash(hash_field: str, guess: str) -> bool:
+    """Verify guess against hash_field. Supports yescrypt ($y$) via crypt_r."""
+    if not hash_field:
+        return False
+
+    # yescrypt via crypt_r
+    if hash_field.startswith("$y$"):
+        if crypt_r is None:
+            return False
+        try:
+            out = crypt_r.crypt(guess, hash_field)
+            return out == hash_field
+        except Exception:
+            return False
+
+    # otherwise use passlib
+    try:
+        return CTX.verify(guess, hash_field)
+    except Exception:
+        return False
 
 class Node:
     def __init__(self, host: str, port: int, threads: int):
