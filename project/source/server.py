@@ -59,7 +59,7 @@ class Node:
                     self.server.handle_msg(self, msg)
 
             except Exception as e:
-                print(f"[!] Node#{self.id} reader err: {e}")
+                print(f"Node#{self.id} reader err: {e}")
                 break
 
         self.alive = False
@@ -84,7 +84,7 @@ class Server:
         t = msg["type"]
 
         if t == "register":
-            print(f"[+] Node#{node.id} registered")
+            print(f"Node#{node.id} registered")
             return
 
         if t == "request_work":
@@ -105,7 +105,7 @@ class Server:
 
         if t == "result":
             if msg["found"]:
-                print(f"\n[+] Node#{node.id} cracked it! Password = {msg['password']}\n")
+                print(f"\nNode#{node.id} cracked it! Password = {msg['password']}\n")
                 found_event.set()
                 self.broadcast_stop()
             return
@@ -117,7 +117,7 @@ class Server:
 
     def remove_node(self, node):
         with self.lock:
-            print(f"[-] Node#{node.id} disconnected")
+            print(f"Node#{node.id} disconnected")
             self.nodes = [n for n in self.nodes if n is not node]
 
     def start(self):
@@ -126,7 +126,7 @@ class Server:
         sock.bind(("0.0.0.0", self.args.port))
         sock.listen(50)
 
-        print(f"[*] Listening on port {self.args.port}")
+        print(f"Listening on port {self.args.port}")
 
         while not found_event.is_set():
             try:
@@ -135,7 +135,7 @@ class Server:
                     n = Node(conn, addr, self.node_counter, self)
                     self.nodes.append(n)
                     self.node_counter += 1
-                print(f"[+] Connection from {addr[0]}:{addr[1]}")
+                print(f"Connection from {addr[0]}:{addr[1]}")
             except KeyboardInterrupt:
                 break
 
