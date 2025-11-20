@@ -9,69 +9,60 @@ import sys
 import crypt_r
 from passlib.context import CryptContext
 
-# ====================== CRACKING LOGIC (ONLY ON NODE) ======================
-LEGALCHAR = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789@#%^&*()_+-=.,:;?"
-BASE = len(LEGALCHAR)
+LEGAL = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789@#%^&*()_+-=.,:;?"
+BASE = len(LEGAL)
 
 ctx = CryptContext(
     schemes=["bcrypt", "sha512_crypt", "sha256_crypt", "md5_crypt"],
     deprecated="auto",
 )
 
-def idx_to_guess(i: int, length: int) -> str:
-    chars = []
-    idx = i
+def idx_to_guess(n, length):
+    out = []
     for _ in range(length):
-        chars.append(LEGALCHAR[idx % BASE])
-        idx //= BASE
-    return "".join(reversed(chars))
+        out.append(LEGAL[n % BASE])
+        n //= BASE
+    return "".join(reversed(out))
 
-def verify_hash(hash_field: str, password_guess: str) -> bool:
+def verify(hash_field, guess):
     if hash_field.startswith("$y$"):  # yescrypt
         try:
-            out = crypt_r.crypt(password_guess, hash_field)
-            return out == hash_field
+            return crypt_r.crypt(guess, hash_field) == hash_field
         except:
             return False
-    else:
-        try:
-            return ctx.verify(password_guess, hash_field)
-        except:
-            return False
-# ==========================================================================
+    try:
+        return ctx.verify(guess, hash_field)
+    except:
+        return False
 
-class WorkerNode:
-    def __init__(self, server_ip: str, port: int, threads: int):
-        self.server_ip = server_ip
+class NodeClient:
+    def __init__(self, server, port, threads):
+        self.server = server
         self.port = port
         self.threads = threads
-        self.current_target = None
-        self.stop_event = threading.Event()
+        self.stop = threading.Event()
 
-    def connect(self):
-        while not self.stop_event.is_set():
-            try:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.connect((self.server_ip, self.port))
-                self.sock = sock
-                self.send({"type": "register"})
-                print(f"[+] Connected to {self.server_ip}:{self.port}")
-                self.receive_loop()
-                return
-            except Exception as e:
-                print(f"[-] Connection failed: {e} – retrying in 5s")
-                time.sleep(5)
-
-    def send(self, msg: dict):
+    def send(self, msg):
         try:
-            data = json.dumps(msg).encode("utf-8") + b"\n"
-            self.sock.sendall(data)
+            self.sock.sendall(json.dumps(msg).encode() + b"\n")
         except:
             pass
 
-    def receive_loop(self):
+    def connect_loop(self):
+        while not self.stop.is_set():
+            try:
+                self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self.sock.connect((self.server, self.port))
+                self.send({"type": "register"})
+                print("[+] Connected")
+                self.reader()
+            except Exception as e:
+                print(f"Retrying: {e}")
+                time.sleep(2)
+
+    def reader(self):
         buf = b""
-        while not self.stop_event.is_set():
+        while not self.stop.is_set():
             try:
                 data = self.sock.recv(4096)
                 if not data:
@@ -79,77 +70,62 @@ class WorkerNode:
                 buf += data
                 while b"\n" in buf:
                     line, buf = buf.split(b"\n", 1)
-                    if line:
-                        msg = json.loads(line.decode("utf-8"))
+                    if line.strip():
+                        msg = json.loads(line)
                         self.handle(msg)
             except:
                 break
-        print("[-] Disconnected from server")
+        print("[-] Disconnected")
 
-    def handle(self, msg: dict):
+    def handle(self, msg):
         tp = msg["type"]
-        if tp == "new_target":
-            self.current_target = {
-                "username": msg["username"],
-                "hash": msg["hash"],
-                "interval": msg["checkpoint_interval"]
-            }
-            print(f"[+] Cracking user: {msg['username']}")
+
+        if tp == "work":
+            print(f"[+] Received work L={msg['length']} [{msg['start_idx']}..{msg['end_idx']})")
+
             for _ in range(self.threads):
-                t = threading.Thread(target=self.crack_target, daemon=True)
-                t.start()
+                threading.Thread(target=self.worker, args=(msg,), daemon=True).start()
 
         elif tp == "stop":
-            print("[i] Stop signal received")
-            self.stop_event.set()
+            print("[!] STOP received")
+            self.stop.set()
 
-    def crack_target(self):
-        target = self.current_target
-        if not target:
-            return
+    def worker(self, w):
+        length = w["length"]
+        start = w["start_idx"]
+        end = w["end_idx"]
+        h = w["hash"]
+        checkpoint = w["checkpoint"]
 
-        username = target["username"]
-        h = target["hash"]
-        interval = target["interval"]
+        next_cp = start + checkpoint
 
-        length = 1
-        while not self.stop_event.is_set():
-            total = BASE ** length
-            i = 0
-            next_cp = interval
+        for i in range(start, end):
+            if self.stop.is_set():
+                return
 
-            while i < total and not self.stop_event.is_set():
-                guess = idx_to_guess(i, length)
-                if verify_hash(h, guess):
-                    print(f"\n*** PASSWORD FOUND for {username}: {guess} ***")
-                    self.send({"type": "found", "username": username, "password": guess})
-                    self.stop_event.set()
-                    return
+            guess = idx_to_guess(i, length)
+            if verify(h, guess):
+                print(f"PASSWORD FOUND: {guess}")
+                self.send({"type": "found", "username": w["username"], "password": guess})
+                self.stop.set()
+                return
 
-                if i >= next_cp:
-                    self.send({"type": "checkpoint", "username": username, "length": length, "idx": i})
-                    next_cp += interval
-                i += 1
-
-            print(f"[i] Finished length {length} for {username}")
-            length += 1
-            if length > 12:
-                break
-
-        self.send({"type": "checkpoint", "username": username, "length": length, "idx": 0})
+            if i >= next_cp:
+                self.send({"type": "checkpoint", "username": w["username"], "idx": i})
+                next_cp += checkpoint
 
     def run(self):
-        while not self.stop_event.is_set():
-            self.connect()
-            time.sleep(5)
+        self.connect_loop()
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Distributed Password Cracker – Node")
+    parser = argparse.ArgumentParser()
     parser.add_argument("--server", required=True)
-    parser.add_argument("--port", type=int, default=5000)
+    parser.add_argument("--port", type=int, default=9000)
     parser.add_argument("--threads", type=int, default=4)
     args = parser.parse_args()
 
     signal.signal(signal.SIGINT, lambda s, f: sys.exit(0))
-    node = WorkerNode(args.server, args.port, args.threads)
-    node.run()
+    n = NodeClient(args.server, args.port, args.threads)
+    n.run()
+
