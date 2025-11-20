@@ -6,14 +6,22 @@ import time
 import sys
 import signal
 
-# === SHARED BRUTE-FORCE SPACE (MUST BE IDENTICAL IN NODE) ===
-CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789@#%^&*()_+-=.,:;?"
-BASE = len(CHARS)  # 77
-# ===========================================================
+LEGAL = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789@#%^&*()_+-=.,:;?"
+BASE = len(LEGAL)
 
+ATOMIC_START = 0
 atomic_lock = threading.Lock()
-atomic_counter = 0
+atomic_counter = ATOMIC_START
+
 found_event = threading.Event()
+
+def atomic_next():
+    global atomic_counter
+    with atomic_lock:
+        v = atomic_counter
+        atomic_counter += 1
+        return v
+
 
 class Node:
     def __init__(self, conn, addr, node_id, server):
@@ -23,10 +31,8 @@ class Node:
         self.server = server
         self.alive = True
         self.last_seen = time.time()
-        self.has_work = False  # Fair distribution: only one block at a time
 
         threading.Thread(target=self.reader, daemon=True).start()
-        threading.Thread(target=self.timeout_watcher, daemon=True).start()
 
     def send(self, msg: dict):
         try:
@@ -35,20 +41,6 @@ class Node:
         except:
             self.alive = False
 
-    def update_activity(self):
-        self.last_seen = time.time()
-
-    def timeout_watcher(self):
-        while self.alive and not found_event.is_set():
-            if time.time() - self.last_seen > self.server.args.timeout:
-                print(f"[-] Node#{self.id} ({self.addr[0]}) TIMED OUT (no checkpoint in {self.server.args.timeout}s)")
-                self.alive = False
-                self.server.remove_node(self)
-                try: self.conn.close()
-                except: pass
-                break
-            time.sleep(5)
-
     def reader(self):
         buf = b""
         while self.alive and not found_event.is_set():
@@ -56,92 +48,77 @@ class Node:
                 data = self.conn.recv(4096)
                 if not data:
                     break
+
                 buf += data
                 while b"\n" in buf:
                     line, buf = buf.split(b"\n", 1)
                     if not line.strip():
                         continue
+
                     msg = json.loads(line)
-                    self.update_activity()
                     self.server.handle_msg(self, msg)
-            except:
+
+            except Exception as e:
+                print(f"[!] Node#{self.id} reader err: {e}")
                 break
+
         self.alive = False
         self.server.remove_node(self)
 
 
 class Server:
-    def __init__(self, args):
+    def __init__(self, users, args):
+        self.users = users
         self.args = args
+
         self.hash = args.hash
+
         self.nodes = []
+        self.pending = []
+        self.assigned = {}
+
         self.lock = threading.Lock()
         self.node_counter = 0
 
     def handle_msg(self, node, msg):
-        t = msg.get("type")
+        t = msg["type"]
 
         if t == "register":
-            print(f"[+] Node#{node.id} connected from {node.addr[0]}:{node.addr[1]}")
+            print(f"[+] Node#{node.id} registered")
             return
 
         if t == "request_work":
-            node.update_activity()
-            node.has_work = False  # Finished previous block
-
             if found_event.is_set():
                 node.send({"type": "stop"})
                 return
 
-            start = self.next_index()
+            start = atomic_next()
             end = start + self.args.work_size
-            node.has_work = True
 
             node.send({
                 "type": "work",
                 "start_idx": start,
                 "end_idx": end,
-                "hash": self.hash,
-                "checkpoint_every": self.args.checkpoint
+                "hash": self.hash
             })
-            print(f"[→] Node#{node.id} → {start:,}–{end-1:,} ({self.args.work_size:,} passwords)")
-            return
-
-        if t == "checkpoint":
-            reached = msg.get("last_checked", "?")
-            print(f"[✓] Node#{node.id} checkpoint @ {reached:,}")
             return
 
         if t == "result":
-            node.has_work = False
-            if msg.get("found"):
-                pw = msg.get("password", "UNKNOWN")
-                print(f"\n{'='*70}")
-                print(f"[!!!] PASSWORD CRACKED BY Node#{node.id}!")
-                print(f"[!!!] Password: {pw}")
-                print(f"{'='*70}\n")
+            if msg["found"]:
+                print(f"\n[+] Node#{node.id} cracked it! Password = {msg['password']}\n")
                 found_event.set()
                 self.broadcast_stop()
             return
 
-    def next_index(self):
-        global atomic_counter
-        with atomic_lock:
-            v = atomic_counter
-            atomic_counter += self.args.work_size  # ← Correct chunking
-            return v
-
     def broadcast_stop(self):
-        for n in list(self.nodes):
+        for n in self.nodes:
             if n.alive:
                 n.send({"type": "stop"})
 
     def remove_node(self, node):
         with self.lock:
-            if node in self.nodes:
-                self.nodes.remove(node)
-            node.has_work = False
-            print(f"[-] Node#{node.id} ({node.addr[0]}) disconnected")
+            print(f"[-] Node#{node.id} disconnected")
+            self.nodes = [n for n in self.nodes if n is not node]
 
     def start(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -149,42 +126,37 @@ class Server:
         sock.bind(("0.0.0.0", self.args.port))
         sock.listen(50)
 
-        print(f"[*] Distributed cracker server STARTED")
-        print(f" ├─ Port         : {self.args.port}")
-        print(f" ├─ Target hash  : {self.args.hash[:60]}...")
-        print(f" ├─ Work size    : {self.args.work_size:,}")
-        print(f" ├─ Checkpoint   : every {self.args.checkpoint:,}")
-        print(f" └─ Timeout      : {self.args.timeout}s")
-        print("\n[?] Waiting for workers...\n")
+        print(f"[*] Listening on port {self.args.port}")
 
         while not found_event.is_set():
             try:
-                sock.settimeout(1.0)
                 conn, addr = sock.accept()
-                sock.settimeout(None)
-                node = Node(conn, addr, self.node_counter, self)
                 with self.lock:
-                    self.nodes.append(node)
+                    n = Node(conn, addr, self.node_counter, self)
+                    self.nodes.append(n)
                     self.node_counter += 1
-            except socket.timeout:
-                continue
+                print(f"[+] Connection from {addr[0]}:{addr[1]}")
             except KeyboardInterrupt:
-                print("\n[!] Shutting down...")
                 break
-
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=5000)
-    parser.add_argument("--hash", type=str, required=True)
+    parser.add_argument("--hash", required=True, help="Password hash to crack")
     parser.add_argument("--work-size", type=int, default=1000)
     parser.add_argument("--checkpoint", type=int, default=500)
     parser.add_argument("--timeout", type=int, default=600)
+
     args = parser.parse_args()
 
-    Server(args).start()
+    users = [("target", args.hash)]
+
+    global server
+    server = Server(users, args)
+    server.start()
 
 
 if __name__ == "__main__":
     signal.signal(signal.SIGINT, lambda s, f: sys.exit(0))
     main()
+
