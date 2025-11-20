@@ -5,10 +5,11 @@ import json
 import time
 import sys
 import signal
-import os
 
-LEGAL = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789@#%^&*()_+-=.,:;?"
-BASE = len(LEGAL)
+# === SHARED BRUTE-FORCE SPACE (MUST BE IDENTICAL IN NODE) ===
+CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789@#%^&*()_+-=.,:;?"
+BASE = len(CHARS)  # 77
+# ===========================================================
 
 atomic_lock = threading.Lock()
 atomic_counter = 0
@@ -22,6 +23,7 @@ class Node:
         self.server = server
         self.alive = True
         self.last_seen = time.time()
+        self.has_work = False  # Fair distribution: only one block at a time
 
         threading.Thread(target=self.reader, daemon=True).start()
         threading.Thread(target=self.timeout_watcher, daemon=True).start()
@@ -39,7 +41,7 @@ class Node:
     def timeout_watcher(self):
         while self.alive and not found_event.is_set():
             if time.time() - self.last_seen > self.server.args.timeout:
-                print(f"[-] Node#{self.id} ({self.addr[0]}) TIMED OUT – no activity for {self.server.args.timeout}s")
+                print(f"[-] Node#{self.id} ({self.addr[0]}) TIMED OUT (no checkpoint in {self.server.args.timeout}s)")
                 self.alive = False
                 self.server.remove_node(self)
                 try: self.conn.close()
@@ -84,12 +86,16 @@ class Server:
             return
 
         if t == "request_work":
+            node.update_activity()
+            node.has_work = False  # Finished previous block
+
             if found_event.is_set():
                 node.send({"type": "stop"})
                 return
 
             start = self.next_index()
             end = start + self.args.work_size
+            node.has_work = True
 
             node.send({
                 "type": "work",
@@ -98,31 +104,31 @@ class Server:
                 "hash": self.hash,
                 "checkpoint_every": self.args.checkpoint
             })
-            # Only light log – no full range spam
-            print(f"[→] Node#{node.id} requested work → assigned {self.args.work_size:,} attempts")
+            print(f"[→] Node#{node.id} → {start:,}–{end-1:,} ({self.args.work_size:,} passwords)")
             return
 
         if t == "checkpoint":
             reached = msg.get("last_checked", "?")
-            print(f"[✓] Node#{node.id} checkpoint → {reached:,}")
+            print(f"[✓] Node#{node.id} checkpoint @ {reached:,}")
             return
 
         if t == "result":
+            node.has_work = False
             if msg.get("found"):
-                password = msg.get("password", "UNKNOWN")
-                print(f"\n{'='*60}")
+                pw = msg.get("password", "UNKNOWN")
+                print(f"\n{'='*70}")
                 print(f"[!!!] PASSWORD CRACKED BY Node#{node.id}!")
-                print(f"[!!!] Password: {password}")
-                print(f"{'='*60}\n")
+                print(f"[!!!] Password: {pw}")
+                print(f"{'='*70}\n")
                 found_event.set()
                 self.broadcast_stop()
             return
 
     def next_index(self):
+        global atomic_counter
         with atomic_lock:
-            global atomic_counter
             v = atomic_counter
-            atomic_counter += self.args.work_size
+            atomic_counter += self.args.work_size  # ← Correct chunking
             return v
 
     def broadcast_stop(self):
@@ -134,6 +140,7 @@ class Server:
         with self.lock:
             if node in self.nodes:
                 self.nodes.remove(node)
+            node.has_work = False
             print(f"[-] Node#{node.id} ({node.addr[0]}) disconnected")
 
     def start(self):
@@ -142,13 +149,13 @@ class Server:
         sock.bind(("0.0.0.0", self.args.port))
         sock.listen(50)
 
-        print(f"[*] Distributed cracker server started")
-        print(f" ├─ Port          : {self.args.port}")
-        print(f" ├─ Target hash   : {self.args.hash}")
-        print(f" ├─ Work size     : {self.args.work_size:,}")
-        print(f" ├─ Checkpoint    : every {self.args.checkpoint:,} attempts")
-        print(f" └─ Timeout       : {self.args.timeout}s → kill node")
-        print(f"\n[?] Waiting for workers...\n")
+        print(f"[*] Distributed cracker server STARTED")
+        print(f" ├─ Port         : {self.args.port}")
+        print(f" ├─ Target hash  : {self.args.hash[:60]}...")
+        print(f" ├─ Work size    : {self.args.work_size:,}")
+        print(f" ├─ Checkpoint   : every {self.args.checkpoint:,}")
+        print(f" └─ Timeout      : {self.args.timeout}s")
+        print("\n[?] Waiting for workers...\n")
 
         while not found_event.is_set():
             try:
@@ -162,21 +169,20 @@ class Server:
             except socket.timeout:
                 continue
             except KeyboardInterrupt:
-                print("\n[!] Shutting down server...")
+                print("\n[!] Shutting down...")
                 break
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Distributed password cracker - server")
-    parser.add_argument("--port", type=int, default=5000, help="Port the server listens on")
-    parser.add_argument("--hash", type=str, required=True, help="Hashed password to crack")
-    parser.add_argument("--work-size", type=int, default=1000, help="Number of passwords assigned per node request")
-    parser.add_argument("--checkpoint", type=int, default=500, help="Number of attempts before a node sends a checkpoint")
-    parser.add_argument("--timeout", type=int, default=600, help="Seconds without checkpoint → kill node")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--port", type=int, default=5000)
+    parser.add_argument("--hash", type=str, required=True)
+    parser.add_argument("--work-size", type=int, default=1000)
+    parser.add_argument("--checkpoint", type=int, default=500)
+    parser.add_argument("--timeout", type=int, default=600)
     args = parser.parse_args()
 
-    server = Server(args)
-    server.start()
+    Server(args).start()
 
 
 if __name__ == "__main__":
