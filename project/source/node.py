@@ -4,6 +4,15 @@ import threading
 import json
 import time
 import sys
+import threading
+
+# Atomic brute-force index
+global_counter = 0
+counter_lock = threading.Lock()
+
+# Character set
+CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()-_=+[]{}|;:',.<>?/`~"
+BASE = len(CHARS)
 
 try:
     import crypt_r
@@ -12,22 +21,44 @@ except Exception:
 
 from passlib.context import CryptContext
 
-CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789@#%^&*()_+-=.,:;?"
-BASE = len(CHARS)
 
 CTX = CryptContext(
     schemes=["bcrypt", "sha512_crypt", "sha256_crypt", "md5_crypt"],
     deprecated="auto",
 )
 
-def idx_to_guess(idx: int) -> str:
-    if idx == 0:
-        return CHARS[0]
+def idx_to_password(idx: int) -> str:
+    """
+    Converts a monotonic index (0,1,2,3...) into a brute-force password.
+    This method produces:
+    a, b, c, ..., ?, aa, ab, ac, ..., aaa, aab, ...
+    with NO max length.
+    """
+    length = 1
+    count = BASE  # number of passwords of length 1
+
+    # Determine which password length this index falls into
+    while idx >= count:
+        idx -= count
+        length += 1
+        count *= BASE  # BASE^length
+
+    # Now idx is within this length; decode in base-N with fixed digits
     out = []
-    while idx > 0:
+    for _ in range(length):
         out.append(CHARS[idx % BASE])
         idx //= BASE
+
     return "".join(reversed(out))
+
+def get_next_password() -> tuple[int, str]:
+    global global_counter
+
+    with counter_lock:
+        idx = global_counter
+        global_counter += 1
+
+    return idx, idx_to_password(idx)
 
 def verify_hash(hash_field: str, guess: str) -> bool:
     if not hash_field:
@@ -186,7 +217,7 @@ class Node:
                         break
                     self.current_work["next_idx"] += 1
 
-                guess = idx_to_guess(idx)
+                idx, guess = get_next_password()
                 if verify_hash(work["hash"], guess):
                     print(f"\n[!!!] PASSWORD CRACKED: {guess}\n")
                     self.send({
