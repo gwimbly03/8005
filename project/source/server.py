@@ -92,10 +92,13 @@ class Server:
                 node.send({"type": "stop"})
                 return
 
-            idx = atomic_next()
+            start = atomic_next()
+            end = start + self.args.work_size
+
             node.send({
                 "type": "work",
-                "index": idx,
+                "start_idx": start,
+                "end_idx": end,
                 "hash": self.hash
             })
             return
