@@ -190,14 +190,14 @@ class Server:
 
     def health_check(self):
         """Disconnect nodes that haven't checked in within timeout."""
-    while not found_event.is_set():
-        time.sleep(5)
-        now = time.time()
-        with self.lock:
-            for node in list(self.nodes):
-                if node.alive and now - node.last_seen > self.args.timeout:
-                    print(f"[!] Node#{node.id} timed out (> {self.args.timeout}s)")
-                    node.conn.close()  # triggers node_lost
+        while not found_event.is_set():
+            time.sleep(5)
+            now = time.time()
+            with self.lock:
+                for node in list(self.nodes):
+                    if node.alive and now - node.last_seen > self.args.timeout:
+                        print(f"[!] Node#{node.id} timed out (> {self.args.timeout}s)")
+                        node.conn.close()  # triggers node_lost
 
     def start(self):
         self.load()
