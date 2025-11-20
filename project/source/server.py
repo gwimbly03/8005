@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 import argparse
 import socket
 import threading
@@ -58,11 +57,11 @@ class NodeConnection:
                     try:
                         msg = json.loads(line.decode())
                     except Exception:
-                        print(f"[!] Invalid JSON from Node#{self.id}")
+                        print(f"Invalid JSON from Node#{self.id}")
                         continue
                     self.server.handle_msg(self, msg)
         except Exception as e:
-            print(f"[!] Node#{self.id} reader error: {e}")
+            print(f"Node#{self.id} reader error: {e}")
         finally:
             self.alive = False
             self.server.node_lost(self)
@@ -90,12 +89,12 @@ class Server:
             sock.bind(("0.0.0.0", self.args.port))
             sock.listen(50)
         except Exception as e:
-            print(f"[!] Failed to bind/listen: {e}")
+            print(f"Failed to bind/listen: {e}")
             sys.exit(1)
 
-        print(f"[*] Listening on :{self.args.port}")
-        print(f"[*] Hash = {self.hash}")
-        print(f"[*] work-size={self.args.work_size} checkpoint={self.args.checkpoint} timeout={self.args.timeout}")
+        print(f"Listening on :{self.args.port}")
+        print(f"Hash = {self.hash}")
+        print(f"work-size={self.args.work_size} checkpoint={self.args.checkpoint} timeout={self.args.timeout}")
 
         while not found_event.is_set():
             try:
@@ -104,11 +103,11 @@ class Server:
                     node = NodeConnection(conn, addr, self.node_id_counter, self)
                     self.node_id_counter += 1
                     self.nodes.append(node)
-                print(f"[+] Node#{node.id} connected from {addr[0]}:{addr[1]}")
+                print(f"Node#{node.id} connected from {addr[0]}:{addr[1]}")
             except KeyboardInterrupt:
                 break
             except Exception as e:
-                print(f"[!] Accept error: {e}")
+                print(f"Accept error: {e}")
 
         try:
             sock.close()
@@ -117,15 +116,12 @@ class Server:
 
         self.broadcast_stop()
 
-    # ──────────────────────────────────
-    # Message Handling
-    # ──────────────────────────────────
     def handle_msg(self, node: NodeConnection, msg: dict):
         t = msg.get("type")
         node.last_seen = time.time()
 
         if t == "register":
-            print(f"[+] Node#{node.id} registered (threads={msg.get('threads')})")
+            print(f"Node#{node.id} registered (threads={msg.get('threads')})")
             return
 
         if t == "request_work":
@@ -150,7 +146,7 @@ class Server:
                 "checkpoint": self.args.checkpoint,
                 "timeout": self.args.timeout
             })
-            print(f"[→] Node#{node.id} assigned [{start:,}..{end:,})")
+            print(f"Node#{node.id} assigned [{start:,}..{end:,})")
             return
 
         if t == "checkpoint":
@@ -160,30 +156,22 @@ class Server:
             with node.lock:
                 if node.current_work:
                     node.current_work["last_checkpoint"] = int(idx)
-            print(f"[*] Checkpoint Node#{node.id} idx={int(idx):,}")
+            print(f"Checkpoint Node#{node.id} idx={int(idx):,}")
             return
 
         if t == "result":
-            # ───────────────────────────────
-            # PASSWORD FOUND — ONLY PRINT IT
-            # ───────────────────────────────
             if msg.get("found"):
                 plaintext = msg.get("password", "<unknown>")
-                print("\n" + "=" * 70)
-                print(f"[+] Node#{node.id} cracked the password!")
-                print(f"[+] Plaintext: {plaintext}")
-                print("=" * 70 + "\n")
+                print(f"Node#{node.id} cracked the password!")
+                print(f"Plaintext: {plaintext}")
                 found_event.set()
                 self.broadcast_stop()
             return
 
-    # ──────────────────────────────────
-    # Pending Work
-    # ──────────────────────────────────
     def requeue_range(self, start: int, end: int):
         with self.pending_lock:
             self.pending.append((start, end))
-        print(f"[i] Requeued [{start:,}..{end:,})")
+        print(f"Requeued [{start:,}..{end:,})")
 
     def try_assign_from_pending(self, node: NodeConnection) -> bool:
         with self.pending_lock:
@@ -202,15 +190,12 @@ class Server:
             "checkpoint": self.args.checkpoint,
             "timeout": self.args.timeout
         })
-        print(f"[→] Node#{node.id} assigned REQUEUED [{start:,}..{end:,})")
+        print(f"Node#{node.id} assigned REQUEUED [{start:,}..{end:,})")
         return True
 
-    # ──────────────────────────────────
-    # Node Disconnect/Timeout
-    # ──────────────────────────────────
     def node_lost(self, node: NodeConnection):
         with self.lock:
-            print(f"[-] Node#{node.id} disconnected")
+            print(f"Node#{node.id} disconnected")
 
             with node.lock:
                 w = node.current_work
@@ -232,7 +217,7 @@ class Server:
                     if not node.alive:
                         continue
                     if now - node.last_seen > self.args.timeout:
-                        print(f"[!] Node#{node.id} TIMEOUT -> requeue remaining work")
+                        print(f"Node#{node.id} TIMEOUT -> requeue remaining work")
 
                         with node.lock:
                             w = node.current_work
@@ -250,11 +235,8 @@ class Server:
                         node.alive = False
                         self.nodes = [n for n in self.nodes if n is not node]
 
-    # ──────────────────────────────────
-    # STOP
-    # ──────────────────────────────────
     def broadcast_stop(self):
-        print("[*] Broadcasting STOP to all nodes...")
+        print("Broadcasting STOP to all nodes...")
         with self.lock:
             for n in self.nodes:
                 try:
@@ -275,7 +257,7 @@ def main():
     srv = Server(args.hash, args)
 
     def sigint(x, y):
-        print("[!] CTRL+C — shutting down")
+        print("CTRL+C — shutting down")
         found_event.set()
         srv.broadcast_stop()
         sys.exit(0)

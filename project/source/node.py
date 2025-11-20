@@ -171,7 +171,7 @@ class Node:
             print(f"New work assigned: [{start:,}..{end:,}) timeout={timeout}s checkpoint={checkpoint}")
 
         elif tp == "stop":
-            print("[!] Stop received from server")
+            print("Stop received from server")
             self.stop_event.set()
             with self.work_lock:
                 self.current_work = None
@@ -203,7 +203,7 @@ class Node:
 
                     # TIMEOUT LOGIC
                     if time.time() - work["assigned_time"] >= work["timeout"]:
-                        print("[!] Work timeout reached — requesting new work")
+                        print("Work timeout reached — requesting new work")
                         self.current_work = None
                         self.work_available.clear()
                         break
