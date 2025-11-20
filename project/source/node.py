@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import argparse
 import socket
 import threading
@@ -23,13 +24,16 @@ CTX = CryptContext(
 
 def idx_to_guess(idx: int) -> str:
     """Convert integer index -> password string (variable length)."""
+    if idx < 0:
+        raise ValueError("Index must be non-negative")
+    # special-case 0 -> first char
     if idx == 0:
         return CHARS[0]
-    out = []
+    chars = []
     while idx > 0:
-        out.append(CHARS[idx % BASE])
+        chars.append(CHARS[idx % BASE])
         idx //= BASE
-    return "".join(reversed(out))
+    return "".join(reversed(chars))
 
 
 def verify_hash(hash_field: str, guess: str) -> bool:
@@ -110,15 +114,12 @@ class Node:
     # -----------------------
     def heartbeat_loop(self):
         # simple periodic heartbeat so server's timeout monitor sees us alive
-        # interval chosen reasonably small; harmless if server also gets progress messages
         while not self.stop_event.is_set():
             try:
-                # only send if socket is present
                 with self.sock_lock:
                     sock_present = self.sock is not None
                 if sock_present:
                     self.safe_send({"type": "heartbeat"})
-                # sleep; wake frequently enough to satisfy typical timeouts
                 time.sleep(10)
             except Exception:
                 time.sleep(1)
@@ -252,18 +253,11 @@ class Node:
                     continue
 
             # extract parameters
-            start = work["start_idx"]
-            end = work["end_idx"]       # inclusive
             target_hash = work["hash"]
             checkpoint_interval = int(work.get("checkpoint", 0))
             timeout = int(work.get("timeout", 0))
             username = work.get("username")
             assigned_time = float(work.get("assigned_time", time.time()))
-
-            # initialize per-worker last_progress_sent from work
-            # note: stored under work so threads share the same checkpoint bookkeeping
-            with self.work_lock:
-                last_progress_sent = work.get("last_progress_sent", start)
 
             while True:
                 if self.stop_event.is_set():
@@ -311,7 +305,7 @@ class Node:
                 if checkpoint_interval > 0:
                     # send progress if we've advanced at least checkpoint_interval since last_progress_sent
                     with self.work_lock:
-                        last_sent = work.get("last_progress_sent", start)
+                        last_sent = work.get("last_progress_sent", work["start_idx"])
                         if (next_idx - last_sent) >= checkpoint_interval:
                             # update shared last_progress_sent
                             work["last_progress_sent"] = next_idx
@@ -356,3 +350,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
