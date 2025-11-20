@@ -67,12 +67,16 @@ class Node:
 
 
 class Server:
-    def __init__(self, args):
+    def __init__(self, users, args):
+        self.users = users
         self.args = args
+
         self.nodes = []
+        self.pending = []
+        self.assigned = {}
+
         self.lock = threading.Lock()
         self.node_counter = 0
-        self.hash = args.hash
 
     def handle_msg(self, node, msg):
         t = msg["type"]
