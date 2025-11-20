@@ -198,51 +198,55 @@ class Node:
             if self.stop_event.is_set():
                 break
 
-            work = None
             with self.work_lock:
-                if self.current_work:
-                    work = self.current_work.copy()
+                work = self.current_work
 
             if not work:
                 continue
 
             # ---- Crack the chunk ----
             while not self.stop_event.is_set():
+
                 with self.work_lock:
+                    # If server cleared or replaced our work, stop immediately
                     if self.current_work is None:
                         break
 
+                    work = self.current_work   # always use live copy
+                    idx = work["next_idx"]
 
-                    idx = self.current_work["next_idx"]
                     if idx >= work["end"]:
-                        # Done this block
+                        # Finished this block
                         self.current_work = None
                         self.work_event.clear()
                         break
 
-                    self.current_work["next_idx"] += 1
+                    # advance the global chunk index
+                    work["next_idx"] += 1
 
+                # generate the password
                 guess = idx_to_password(idx)
 
+                # check against hash
                 if verify_hash(work["hash"], guess):
                     print(f"\n[!!!] PASSWORD FOUND: {guess}\n")
                     self.send({"type": "result", "found": True, "password": guess})
                     self.stop_event.set()
                     return
 
-                # Send checkpoint if needed
-                if work["checkpoint_every"] > 0:
-                    with self.work_lock:
-                        real = self.current_work
-                        if real and (idx - real["last_checkpoint_idx"]) >= work["checkpoint_every"]:
+                # Checkpoint logic (must use live self.current_work)
+                with self.work_lock:
+                    real = self.current_work
+                    if real and real["checkpoint_every"] > 0:
+                        if idx - real["last_checkpoint_idx"] >= real["checkpoint_every"]:
                             real["last_checkpoint_idx"] = idx
                             self.send({"type": "checkpoint", "last_checked": idx})
                             print(f"[✓] Checkpoint @ {idx:,}")
 
-
             # ---- Finished → ask server for more work ----
             if not self.stop_event.is_set():
                 self.send({"type": "request_work"})
+
 
 def main():
     parser = argparse.ArgumentParser(description="Distributed Cracker - Worker Node")
