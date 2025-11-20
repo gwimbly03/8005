@@ -51,14 +51,16 @@ class NodeClient:
     def connect_loop(self):
         while not self.stop.is_set():
             try:
+                print(f"[DEBUG] Attempting to connect to {self.server}:{self.port}")
                 self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 self.sock.connect((self.server, self.port))
+                print("[DEBUG] Connected!")
                 self.send({"type": "register"})
-                print("[+] Connected")
                 self.reader()
             except Exception as e:
-                print(f"Retrying: {e}")
+                print(f"[!] Connection failed: {e}")
                 time.sleep(2)
+
 
     def reader(self):
         buf = b""

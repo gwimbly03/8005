@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 import argparse
 import socket
 import threading
@@ -48,17 +47,25 @@ class Node:
             try:
                 data = self.conn.recv(4096)
                 if not data:
+                    print(f"[-] Node#{self.id} disconnected (no data)")
                     break
                 buf += data
                 while b"\n" in buf:
                     line, buf = buf.split(b"\n", 1)
                     if line.strip():
-                        msg = json.loads(line)
-                        server.handle_msg(self, msg)
-            except:
+                        try:
+                            msg = json.loads(line)
+                            print(f"[DEBUG] Node#{self.id} sent: {msg}")
+                            server.handle_msg(self, msg)
+                        except Exception as e:
+                            print(f"[!] Failed to decode JSON from Node#{self.id}: {e}")
+            except Exception as e:
+                print(f"[!] Reader exception Node#{self.id}: {e}")
                 break
         self.alive = False
         server.node_lost(self)
+        print(f"[-] Node#{self.id} reader thread exiting")
+
 
 class Server:
     def __init__(self, users, args):
@@ -206,26 +213,27 @@ class Server:
         threading.Thread(target=self.length_worker, daemon=True).start()
         threading.Thread(target=self.assigner, daemon=True).start()
         threading.Thread(target=self.health_check, daemon=True).start()
-
-
-        # TCP listen
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind(("0.0.0.0", self.args.port))
-        sock.listen(50)
-
-        print(f"[*] Listening on 0.0.0.0:{self.args.port}")
+        try:
+            sock.bind(("0.0.0.0", self.args.port))
+            sock.listen(50)
+            print(f"[*] Listening on 0.0.0.0:{self.args.port}")
+        except Exception as e:
+            print(f"[!] Failed to bind/listen: {e}")
+            sys.exit(1)
 
         while not found_event.is_set():
             try:
                 conn, addr = sock.accept()
+                print(f"[+] Incoming connection from {addr[0]}:{addr[1]}")
                 n = Node(conn, addr, self.node_counter)
                 with self.lock:
                     self.nodes.append(n)
                     self.node_counter += 1
-            except:
+            except KeyboardInterrupt:
+                print("[!] KeyboardInterrupt detected, exiting...")
                 break
-
+            except Exception as e:
+                print(f"[!] Accept failed: {e}")
 
 def main():
     parser = argparse.ArgumentParser()
