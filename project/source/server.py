@@ -132,11 +132,11 @@ class Server:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--port", type=int, default=9000)
+    parser.add_argument("--port", type=int, default=5000)
     parser.add_argument("--hash", required=True, help="Password hash to crack")
-    parser.add_argument("--work-size", type=int, default=500)
-    parser.add_argument("--checkpoint", type=int, default=5000)
-    parser.add_argument("--timeout", type=int, default=60)
+    parser.add_argument("--work-size", type=int, default=1000)
+    parser.add_argument("--checkpoint", type=int, default=500)
+    parser.add_argument("--timeout", type=int, default=600)
 
     args = parser.parse_args()
 
