@@ -38,9 +38,7 @@ def verify_hash(hash_field: str, guess: str) -> bool:
         return False
 
     if hash_field.startswith("$y$"):
-        # yescrypt / similar requiring crypt_r
         if crypt_r is None:
-            # Can't verify yescrypt without crypt_r
             return False
         try:
             out = crypt_r.crypt(guess, hash_field)
@@ -48,7 +46,6 @@ def verify_hash(hash_field: str, guess: str) -> bool:
         except Exception:
             return False
 
-    # other schemes: use passlib
     try:
         return CTX.verify(guess, hash_field)
     except Exception:
@@ -64,24 +61,25 @@ class Node:
         # network
         self.sock = None
         self.sock_lock = threading.Lock()       # protect sends
-        self.recv_lock = threading.Lock()
 
         # work coordination
         self.current_work = None                # dict or None
         self.work_lock = threading.Lock()       # protect current_work fields
         self.work_available = threading.Event() # signals workers a block is present
 
-        # per-work atomic next index (stored inside current_work as 'next_idx')
         # control flags
         self.stop_event = threading.Event()
-        self.shutdown_lock = threading.Lock()
 
-        # start worker threads once
+        # worker threads
         self.workers = []
         for i in range(self.threads):
             t = threading.Thread(target=self.worker_loop, name=f"worker-{i}", daemon=True)
             t.start()
             self.workers.append(t)
+
+        # heartbeat thread (keeps server's last_seen fresh)
+        self.hb_thread = threading.Thread(target=self.heartbeat_loop, daemon=True)
+        self.hb_thread.start()
 
     # -----------------------
     # Networking utilities
@@ -104,10 +102,26 @@ class Node:
                 self.sock.sendall(data)
                 return True
             except Exception as e:
-                # socket likely dead
-                # print minimal debug
                 print(f"[!] Send error: {e}")
                 return False
+
+    # -----------------------
+    # Heartbeat to keep server last_seen fresh
+    # -----------------------
+    def heartbeat_loop(self):
+        # simple periodic heartbeat so server's timeout monitor sees us alive
+        # interval chosen reasonably small; harmless if server also gets progress messages
+        while not self.stop_event.is_set():
+            try:
+                # only send if socket is present
+                with self.sock_lock:
+                    sock_present = self.sock is not None
+                if sock_present:
+                    self.safe_send({"type": "heartbeat"})
+                # sleep; wake frequently enough to satisfy typical timeouts
+                time.sleep(10)
+            except Exception:
+                time.sleep(1)
 
     # -----------------------
     # Main connect / reader
@@ -147,11 +161,9 @@ class Node:
             try:
                 data = self.sock.recv(4096)
                 if not data:
-                    # remote closed
                     print("[!] Server closed connection")
                     break
                 buf += data
-                # process full newline-terminated messages
                 while b"\n" in buf:
                     line, buf = buf.split(b"\n", 1)
                     if not line:
@@ -172,44 +184,53 @@ class Node:
     def handle_message(self, msg: dict):
         tp = msg.get("type")
         if tp == "work":
-            # expected keys: start_idx, end_idx, hash, checkpoint (optional), username (optional)
-            start = int(msg.get("start_idx", 0))
-            end = int(msg.get("end_idx", 0))
-            h = msg.get("hash", "")
+            # expected keys: start_idx, end_idx (inclusive), hash, checkpoint (optional), timeout (optional), assigned_time (optional), username (optional)
+            try:
+                start = int(msg.get("start_idx", 0))
+                end = int(msg.get("end_idx", -1))
+            except Exception:
+                print("[!] Invalid work indices from server")
+                self.safe_send({"type": "request_work"})
+                return
+
+            target_hash = msg.get("hash", "")
             checkpoint = int(msg.get("checkpoint", 0)) if msg.get("checkpoint") is not None else 0
+            timeout = int(msg.get("timeout", 0)) if msg.get("timeout") is not None else 0
+            assigned_time = float(msg.get("assigned_time", time.time()))
             username = msg.get("username")
 
-            if end <= start:
+            if end < start:
                 # nothing to do: request more
                 self.safe_send({"type": "request_work"})
                 return
 
             with self.work_lock:
-                # set the current work, including atomic next index
+                # set the current work, including atomic next index and bookkeeping
                 self.current_work = {
                     "start_idx": start,
-                    "end_idx": end,
-                    "hash": h,
+                    "end_idx": end,               # inclusive
+                    "hash": target_hash,
                     "checkpoint": checkpoint,
+                    "timeout": timeout,
                     "username": username,
+                    "assigned_time": assigned_time,
                     "next_idx": start,
+                    # per-block progress tracking
+                    "last_progress_sent": start
                 }
                 # wake workers
                 self.work_available.set()
 
-            print(f"[+] New work assigned: [{start:,}..{end:,}) checkpoint={checkpoint} username={username}")
+            print(f"[+] New work assigned: [{start:,} .. {end:,}] checkpoint={checkpoint} timeout={timeout} username={username}")
 
         elif tp == "stop":
             print("[!] Stop received from server")
             self.stop_event.set()
-            # let workers finish current iteration if desired
-            # clear work to avoid new attempts
             with self.work_lock:
                 self.current_work = None
                 self.work_available.clear()
 
         elif tp == "ack":
-            # optional, ignore
             pass
 
         else:
@@ -219,8 +240,6 @@ class Node:
     # Worker loop (each thread)
     # -----------------------
     def worker_loop(self):
-        last_checkpoint_sent = 0
-
         while not self.stop_event.is_set():
             # wait for work assignment
             if not self.work_available.wait(timeout=1.0):
@@ -232,58 +251,82 @@ class Node:
                     self.work_available.clear()
                     continue
 
-            # extract server-provided parameters
+            # extract parameters
             start = work["start_idx"]
-            end = work["end_idx"]
+            end = work["end_idx"]       # inclusive
             target_hash = work["hash"]
-            checkpoint_interval = int(work.get("checkpoint", 0))  # from server
-            timeout = int(work.get("timeout", 0))                  # from server
+            checkpoint_interval = int(work.get("checkpoint", 0))
+            timeout = int(work.get("timeout", 0))
             username = work.get("username")
-            assigned_time = work.get("assigned_time", time.time())
+            assigned_time = float(work.get("assigned_time", time.time()))
+
+            # initialize per-worker last_progress_sent from work
+            # note: stored under work so threads share the same checkpoint bookkeeping
+            with self.work_lock:
+                last_progress_sent = work.get("last_progress_sent", start)
 
             while True:
                 if self.stop_event.is_set():
                     return
 
                 with self.work_lock:
+                    # ensure current_work hasn't changed
                     if self.current_work is not work:
                         break
+
                     next_idx = work["next_idx"]
-                    if next_idx >= work["end_idx"]:
+                    # if next_idx is past inclusive end, block is done
+                    if next_idx > work["end_idx"]:
                         self.current_work = None
                         self.work_available.clear()
                         break
-                    # check timeout from server
+
+                    # check server-supplied timeout (compare to assigned_time)
                     if timeout > 0 and (time.time() - assigned_time) >= timeout:
-                        print(f"[!] Work timed out — requesting new block")
+                        print(f"[!] Block timeout reached (assigned {time.time() - assigned_time:.1f}s ago) — requesting new block")
                         self.current_work = None
                         self.work_available.clear()
                         break
+
+                    # allocate current index to this thread
                     work["next_idx"] += 1
 
+                # perform guess and verification outside lock
                 guess = idx_to_guess(next_idx)
                 if verify_hash(target_hash, guess):
-                    print(f"[!!!] PASSWORD FOUND locally: {guess}")
+                    print(f"[!!!] PASSWORD FOUND: {guess}")
                     res = {"type": "result", "found": True, "password": guess}
                     if username is not None:
                         res["username"] = username
                     self.safe_send(res)
+                    # stop all threads
                     self.stop_event.set()
                     with self.work_lock:
                         self.current_work = None
                         self.work_available.clear()
                     return
 
-                # send checkpoints to server
-                if checkpoint_interval > 0 and (next_idx - last_checkpoint_sent) >= checkpoint_interval:
-                    cp_msg = {"type": "checkpoint", "idx": next_idx}
-                    if username is not None:
-                        cp_msg["username"] = username
-                    self.safe_send(cp_msg)
-                    last_checkpoint_sent = next_idx
+                # checkpoint / progress messages
+                sent_progress = False
+                if checkpoint_interval > 0:
+                    # send progress if we've advanced at least checkpoint_interval since last_progress_sent
+                    with self.work_lock:
+                        last_sent = work.get("last_progress_sent", start)
+                        if (next_idx - last_sent) >= checkpoint_interval:
+                            # update shared last_progress_sent
+                            work["last_progress_sent"] = next_idx
+                            sent_progress = True
+
+                    if sent_progress:
+                        msg = {"type": "progress", "current": next_idx}
+                        if username is not None:
+                            msg["username"] = username
+                        self.safe_send(msg)
+                # loop continues until block exhausted or server stops us
 
             # finished block without finding password → request more work
             if not self.stop_event.is_set():
+                time.sleep(0.01)  # tiny backoff to avoid tight loop
                 self.safe_send({"type": "request_work"})
 
 # -----------------------
@@ -302,17 +345,14 @@ def main():
     except KeyboardInterrupt:
         print("[!] KeyboardInterrupt, shutting down")
         node.stop_event.set()
-        # close socket
         with node.sock_lock:
             try:
                 if node.sock:
                     node.sock.close()
             except Exception:
                 pass
-        # give threads a moment
         time.sleep(0.2)
 
 
 if __name__ == "__main__":
     main()
-
