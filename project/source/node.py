@@ -41,18 +41,26 @@ class NodeClient:
         self.port = port
         self.threads = threads
         self.stop = threading.Event()
+        self.sock = None
+        self.lock = threading.Lock()  # protect send
 
     def send(self, msg):
-        try:
-            self.sock.sendall(json.dumps(msg).encode() + b"\n")
-        except:
-            pass
+        """Send a JSON message with debug logging"""
+        with self.lock:
+            try:
+                data = json.dumps(msg).encode() + b"\n"
+                self.sock.sendall(data)
+                print(f"[DEBUG] Sent: {msg}")
+            except Exception as e:
+                print(f"[!] Send failed: {e}")
+                self.stop.set()
 
     def connect_loop(self):
         while not self.stop.is_set():
             try:
                 print(f"[DEBUG] Attempting to connect to {self.server}:{self.port}")
                 self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self.sock.settimeout(10)
                 self.sock.connect((self.server, self.port))
                 print("[DEBUG] Connected!")
                 self.send({"type": "register"})
@@ -61,36 +69,42 @@ class NodeClient:
                 print(f"[!] Connection failed: {e}")
                 time.sleep(2)
 
-
     def reader(self):
         buf = b""
         while not self.stop.is_set():
             try:
                 data = self.sock.recv(4096)
                 if not data:
+                    print("[-] Connection closed by server")
                     break
                 buf += data
                 while b"\n" in buf:
                     line, buf = buf.split(b"\n", 1)
                     if line.strip():
-                        msg = json.loads(line)
-                        self.handle(msg)
-            except:
+                        try:
+                            msg = json.loads(line)
+                            print(f"[DEBUG] Received: {msg}")
+                            self.handle(msg)
+                        except Exception as e:
+                            print(f"[!] JSON parse failed: {e}, line: {line}")
+            except socket.timeout:
+                continue
+            except Exception as e:
+                print(f"[!] Reader error: {e}")
                 break
         print("[-] Disconnected")
 
     def handle(self, msg):
-        tp = msg["type"]
-
+        tp = msg.get("type")
         if tp == "work":
             print(f"[+] Received work L={msg['length']} [{msg['start_idx']}..{msg['end_idx']})")
-
             for _ in range(self.threads):
                 threading.Thread(target=self.worker, args=(msg,), daemon=True).start()
-
         elif tp == "stop":
             print("[!] STOP received")
             self.stop.set()
+        else:
+            print(f"[!] Unknown message type: {tp}")
 
     def worker(self, w):
         length = w["length"]
@@ -98,20 +112,17 @@ class NodeClient:
         end = w["end_idx"]
         h = w["hash"]
         checkpoint = w["checkpoint"]
-
         next_cp = start + checkpoint
 
         for i in range(start, end):
             if self.stop.is_set():
                 return
-
             guess = idx_to_guess(i, length)
             if verify(h, guess):
-                print(f"PASSWORD FOUND: {guess}")
+                print(f"[!!!] PASSWORD FOUND: {guess}")
                 self.send({"type": "found", "username": w["username"], "password": guess})
                 self.stop.set()
                 return
-
             if i >= next_cp:
                 self.send({"type": "checkpoint", "username": w["username"], "idx": i})
                 next_cp += checkpoint
@@ -128,6 +139,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     signal.signal(signal.SIGINT, lambda s, f: sys.exit(0))
-    n = NodeClient(args.server, args.port, args.threads)
-    n.run()
+    node = NodeClient(args.server, args.port, args.threads)
+    node.run()
 
