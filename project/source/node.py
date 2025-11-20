@@ -1,237 +1,114 @@
-import argparse
+#!/usr/bin/env python3
 import socket
-import threading
 import json
+import threading
 import time
-import sys
+import bcrypt
 
-try:
-    import crypt_r
-except Exception:
-    crypt_r = None
+SERVER_IP = "192.168.50.101"
+SERVER_PORT = 5000
+NODE_ID = None
 
-from passlib.context import CryptContext
+running = True
 
-CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789@#%^&*()_+-=.,:;?"
-BASE = len(CHARS)
 
-CTX = CryptContext(
-    schemes=["bcrypt", "sha512_crypt", "sha256_crypt", "md5_crypt"],
-    deprecated="auto",
-)
+def brute_force_chunk(start_idx, end_idx, target_hash, checkpoint, node_sock):
+    global running
 
-def idx_to_guess(idx: int) -> str:
-    if idx == 0:
-        return CHARS[0]
-    out = []
-    while idx > 0:
-        out.append(CHARS[idx % BASE])
-        idx //= BASE
-    return "".join(reversed(out))
+    for idx in range(start_idx, end_idx):
+        if not running:
+            return
 
-def verify_hash(hash_field: str, guess: str) -> bool:
-    if not hash_field:
-        return False
+        candidate = f"pass{idx}"  # Your real generation algorithm goes here
 
-    if hash_field.startswith("$y$"):
-        if crypt_r is None:
-            return False
+        if bcrypt.checkpw(candidate.encode(), target_hash.encode()):
+            print(f"[*] PASSWORD FOUND: {candidate}")
+
+            msg = json.dumps({
+                "type": "found",
+                "node_id": NODE_ID,
+                "password": candidate
+            })
+            node_sock.sendall(msg.encode() + b"\n")
+            return
+
+        # checkpoint output
+        if (idx - start_idx) % checkpoint == 0:
+            print(f"[{NODE_ID}] Progress: {idx}/{end_idx}")
+
+
+def handle_server(sock):
+    global running, NODE_ID
+
+    buf = ""
+    while running:
         try:
-            out = crypt_r.crypt(guess, hash_field)
-            return out == hash_field
-        except Exception:
-            return False
-
-    try:
-        return CTX.verify(guess, hash_field)
-    except Exception:
-        return False
-
-
-class Node:
-    def __init__(self, host: str, port: int, threads: int):
-        self.host = host
-        self.port = port
-        self.threads = threads
-
-        self.sock = None
-        self.sock_lock = threading.Lock()
-        self.recv_lock = threading.Lock()
-
-        self.current_work = None
-        self.work_lock = threading.Lock()
-        self.work_available = threading.Event()
-
-        self.stop_event = threading.Event()
-
-        # Worker threads
-        self.workers = []
-        for i in range(self.threads):
-            t = threading.Thread(target=self.worker_loop, name=f"worker-{i}", daemon=True)
-            t.start()
-            self.workers.append(t)
-
-    def connect(self):
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        s.settimeout(10)
-        s.connect((self.host, self.port))
-        s.settimeout(None)
-        return s
-
-    def safe_send(self, obj: dict):
-        data = (json.dumps(obj) + "\n").encode()
-        with self.sock_lock:
-            try:
-                if self.sock is None:
-                    return False
-                self.sock.sendall(data)
-                return True
-            except Exception as e:
-                print(f"Send error: {e}")
-                return False
-
-    def run(self):
-        while not self.stop_event.is_set():
-            try:
-                print(f"Connecting to server {self.host}:{self.port} ...")
-                self.sock = self.connect()
-                print("Connected")
-
-                self.safe_send({"type": "register", "threads": self.threads})
-                self.safe_send({"type": "request_work"})
-
-                self.reader_loop()
-
-            except Exception as e:
-                print(f"Connection error: {e}")
-                with self.work_lock:
-                    self.current_work = None
-                    self.work_available.clear()
-                time.sleep(1)
-
-            finally:
-                with self.sock_lock:
-                    try:
-                        if self.sock:
-                            self.sock.close()
-                    except:
-                        pass
-                    self.sock = None
-
-    def reader_loop(self):
-        buf = b""
-        while not self.stop_event.is_set():
-            try:
-                data = self.sock.recv(4096)
-                if not data:
-                    print("Server closed connection")
-                    break
-                buf += data
-
-                while b"\n" in buf:
-                    line, buf = buf.split(b"\n", 1)
-                    if not line:
-                        continue
-                    try:
-                        msg = json.loads(line.decode())
-                    except Exception as e:
-                        print(f"JSON decode error: {e}")
-                        continue
-                    self.handle_message(msg)
-
-            except Exception as e:
-                print(f"Reader error: {e}")
+            data = sock.recv(4096)
+            if not data:
                 break
 
-    def handle_message(self, msg: dict):
-        tp = msg.get("type")
-
-        if tp == "work":
-            start = int(msg["start_idx"])
-            end = int(msg["end_idx"])
-            h = msg.get("hash", "")
-
-            if end <= start:
-                self.safe_send({"type": "request_work"})
-                return
-
-            with self.work_lock:
-                self.current_work = {
-                    "start_idx": start,
-                    "end_idx": end,
-                    "hash": h,
-                    "next_idx": start,
-                }
-                self.work_available.set()
-
-            print(f"New work assigned: [{start:,}..{end:,})")
-
-        elif tp == "stop":
-            print("[!] Stop received from server")
-            self.stop_event.set()
-            with self.work_lock:
-                self.current_work = None
-                self.work_available.clear()
-
-        else:
-            print(f"Unknown message: {msg}")
-
-    def worker_loop(self):
-        while not self.stop_event.is_set():
-            if not self.work_available.wait(timeout=1.0):
-                continue
-
-            with self.work_lock:
-                work = self.current_work
-                if work is None:
-                    self.work_available.clear()
+            buf += data.decode()
+            while "\n" in buf:
+                line, buf = buf.split("\n", 1)
+                if not line.strip():
                     continue
 
-            while True:
-                if self.stop_event.is_set():
+                msg = json.loads(line)
+
+                if msg["type"] == "work":
+                    NODE_ID = msg["node_id"]
+                    print(f"[+] Got work: [{msg['start_idx']}..{msg['end_idx']})")
+
+                    t = threading.Thread(
+                        target=brute_force_chunk,
+                        args=(
+                            msg["start_idx"],
+                            msg["end_idx"],
+                            msg["hash"],
+                            msg["checkpoint"],
+                            sock
+                        ),
+                        daemon=True
+                    )
+                    t.start()
+
+                elif msg["type"] == "stop":
+                    print(f"[!] STOP received from server: {msg['reason']}")
+                    running = False
                     return
 
-                with self.work_lock:
-                    if self.current_work is not work:
-                        break
-
-                    next_idx = work["next_idx"]
-                    if next_idx >= work["end_idx"]:
-                        self.current_work = None
-                        self.work_available.clear()
-                        break
-
-                    work["next_idx"] += 1
-
-                guess = idx_to_guess(next_idx)
-                ok = verify_hash(work["hash"], guess)
-
-                if ok:
-                    print(f"Password found: {guess}")
-                    self.safe_send({"type": "result", "found": True, "password": guess})
-                    self.stop_event.set()
-                    return
-
-            if not self.stop_event.is_set():
-                self.safe_send({"type": "request_work"})
+        except Exception as e:
+            print(f"[!] Reader error: {e}")
+            running = False
+            break
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--host", required=True)
-    parser.add_argument("--port", required=True, type=int)
-    parser.add_argument("--threads", required=True, type=int)
-    args = parser.parse_args()
+def connect():
+    global running
+    running = True
 
-    node = Node(args.host, args.port, args.threads)
-    try:
-        node.run()
-    except KeyboardInterrupt:
-        print("KeyboardInterrupt — shutting down")
-        node.stop_event.set()
+    while True:
+        try:
+            print(f"[+] Connecting to server {SERVER_IP}:{SERVER_PORT} ...")
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.connect((SERVER_IP, SERVER_PORT))
+            print("[+] Connected")
+            return sock
+        except:
+            print("[!] Connection failed, retrying...")
+            time.sleep(2)
 
 
 if __name__ == "__main__":
-    main()
+    sock = connect()
+
+    threading.Thread(target=handle_server, args=(sock,), daemon=True).start()
+
+    # Let server know we are ready for more work
+    while running:
+        time.sleep(3)
+        try:
+            sock.sendall(json.dumps({"type": "ready"}).encode() + b"\n")
+        except:
+            break
 

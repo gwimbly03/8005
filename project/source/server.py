@@ -1,162 +1,145 @@
+#!/usr/bin/env python3
 import argparse
 import socket
 import threading
 import json
 import time
-import sys
-import signal
 
-LEGAL = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789@#%^&*()_+-=.,:;?"
-BASE = len(LEGAL)
+class Server:
+    def __init__(self, port, target_hash, work_size, checkpoint, timeout):
+        self.port = port
+        self.target_hash = target_hash
+        self.work_size = work_size
+        self.checkpoint = checkpoint
+        self.timeout = timeout
 
-ATOMIC_START = 0
-atomic_lock = threading.Lock()
-atomic_counter = ATOMIC_START
+        self.nodes = {}
+        self.next_node_id = 1
+        self.lock = threading.Lock()
 
-found_event = threading.Event()
+        self.current_idx = 0
+        self.password_found = False
+        self.found_by = None
+        self.found_password = None
 
-def atomic_next():
-    global atomic_counter
-    with atomic_lock:
-        v = atomic_counter
-        atomic_counter += 1
-        return v
+    def start(self):
+        print(f"[+] Server listening on port {self.port}")
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.bind(("0.0.0.0", self.port))
+        s.listen(20)
 
+        while True:
+            client_sock, addr = s.accept()
+            node_id = f"node-{self.next_node_id}"
+            self.next_node_id += 1
 
-class Node:
-    def __init__(self, conn, addr, node_id, server):
-        self.conn = conn
-        self.addr = addr
-        self.id = node_id
-        self.server = server
-        self.alive = True
-        self.last_seen = time.time()
+            with self.lock:
+                self.nodes[node_id] = {
+                    "sock": client_sock,
+                    "addr": addr,
+                    "last_seen": time.time()
+                }
 
-        threading.Thread(target=self.reader, daemon=True).start()
+            print(f"[+] Node connected: {node_id} from {addr}")
+            threading.Thread(target=self.handle_client, args=(client_sock, node_id), daemon=True).start()
 
-    def send(self, msg: dict):
-        try:
-            data = json.dumps(msg).encode() + b"\n"
-            self.conn.sendall(data)
-        except:
-            self.alive = False
+    def assign_work(self, node_id):
+        if self.password_found:
+            return None
 
-    def reader(self):
-        buf = b""
-        while self.alive and not found_event.is_set():
+        start = self.current_idx
+        end = start + self.work_size
+        self.current_idx = end
+
+        return {
+            "type": "work",
+            "start_idx": start,
+            "end_idx": end,
+            "hash": self.target_hash,
+            "checkpoint": self.checkpoint,
+            "node_id": node_id
+        }
+
+    def handle_client(self, sock, node_id):
+        buf = ""
+
+        # Send initial work immediately
+        work = self.assign_work(node_id)
+        if work:
+            sock.sendall(json.dumps(work).encode() + b"\n")
+            print(f"[+] New work assigned -> {node_id}: [{work['start_idx']}..{work['end_idx']})")
+
+        while True:
             try:
-                data = self.conn.recv(4096)
+                data = sock.recv(4096)
                 if not data:
                     break
 
-                buf += data
-                while b"\n" in buf:
-                    line, buf = buf.split(b"\n", 1)
+                buf += data.decode()
+                while "\n" in buf:
+                    line, buf = buf.split("\n", 1)
                     if not line.strip():
                         continue
 
                     msg = json.loads(line)
-                    self.server.handle_msg(self, msg)
+
+                    # Node heartbeat / ack work
+                    if msg["type"] == "ready" and not self.password_found:
+                        work = self.assign_work(node_id)
+                        if work:
+                            sock.sendall(json.dumps(work).encode() + b"\n")
+                            print(f"[+] New work assigned -> {node_id}: [{work['start_idx']}..{work['end_idx']})")
+
+                    # PASSWORD FOUND
+                    elif msg["type"] == "found":
+                        plaintext = msg["password"]
+
+                        if not self.password_found:
+                            self.password_found = True
+                            self.found_by = node_id
+                            self.found_password = plaintext
+
+                            print("\n" + "=" * 60)
+                            print(f"[!!!] PASSWORD FOUND by {node_id}: {plaintext}")
+                            print("=" * 60 + "\n")
+
+                            # Tell all nodes to stop
+                            self.broadcast_stop()
 
             except Exception as e:
-                print(f"Node#{self.id} reader err: {e}")
+                print(f"[!] Error with {node_id}: {e}")
                 break
 
-        self.alive = False
-        self.server.remove_node(self)
-
-
-class Server:
-    def __init__(self, users, args):
-        self.users = users
-        self.args = args
-
-        self.hash = args.hash
-
-        self.nodes = []
-        self.pending = []
-        self.assigned = {}
-
-        self.lock = threading.Lock()
-        self.node_counter = 0
-
-    def handle_msg(self, node, msg):
-        t = msg["type"]
-
-        if t == "register":
-            print(f"Node#{node.id} registered")
-            return
-
-        if t == "request_work":
-            if found_event.is_set():
-                node.send({"type": "stop"})
-                return
-
-            start = atomic_next()
-            end = start + self.args.work_size
-
-            node.send({
-                "type": "work",
-                "start_idx": start,
-                "end_idx": end,
-                "hash": self.hash
-            })
-            return
-
-        if t == "result":
-            if msg["found"]:
-                print(f"\nNode#{node.id} cracked it! Password = {msg['password']}\n")
-                found_event.set()
-                self.broadcast_stop()
-            return
+        print(f"[!] Node disconnected: {node_id}")
+        with self.lock:
+            if node_id in self.nodes:
+                del self.nodes[node_id]
 
     def broadcast_stop(self):
-        for n in self.nodes:
-            if n.alive:
-                n.send({"type": "stop"})
-
-    def remove_node(self, node):
-        with self.lock:
-            print(f"Node#{node.id} disconnected")
-            self.nodes = [n for n in self.nodes if n is not node]
-
-    def start(self):
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind(("0.0.0.0", self.args.port))
-        sock.listen(50)
-
-        print(f"Listening on port {self.args.port}")
-
-        while not found_event.is_set():
+        msg = json.dumps({"type": "stop", "reason": "password_found"})
+        for n_id, node in list(self.nodes.items()):
             try:
-                conn, addr = sock.accept()
-                with self.lock:
-                    n = Node(conn, addr, self.node_counter, self)
-                    self.nodes.append(n)
-                    self.node_counter += 1
-                print(f"Connection from {addr[0]}:{addr[1]}")
-            except KeyboardInterrupt:
-                break
+                node["sock"].sendall(msg.encode() + b"\n")
+            except:
+                pass
 
-def main():
+
+if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--port", type=int, default=5000)
-    parser.add_argument("--hash", required=True, help="Password hash to crack")
+    parser.add_argument("--port", type=int, required=True)
+    parser.add_argument("--hash", type=str, required=True)
     parser.add_argument("--work-size", type=int, default=1000)
     parser.add_argument("--checkpoint", type=int, default=500)
     parser.add_argument("--timeout", type=int, default=600)
 
     args = parser.parse_args()
 
-    users = [("target", args.hash)]
-
-    global server
-    server = Server(users, args)
-    server.start()
-
-
-if __name__ == "__main__":
-    signal.signal(signal.SIGINT, lambda s, f: sys.exit(0))
-    main()
+    srv = Server(
+        args.port,
+        args.hash,
+        args.work_size,
+        args.checkpoint,
+        args.timeout
+    )
+    srv.start()
 
