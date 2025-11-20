@@ -71,6 +71,8 @@ class Server:
         self.users = users
         self.args = args
 
+        self.hash = args.hash
+
         self.nodes = []
         self.pending = []
         self.assigned = {}
