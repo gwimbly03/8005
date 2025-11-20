@@ -77,7 +77,7 @@ class Server:
         self.node_counter = 0
 
     def handle_msg(self, node, msg):
-        t = msg.getolve("type")
+        t = msg.get("type")
 
         if t == "register":
             print(f"[+] Node#{node.id} connected from {node.addr[0]}:{node.addr[1]}")

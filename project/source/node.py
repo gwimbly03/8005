@@ -122,24 +122,21 @@ class Node:
                 print("[+] Connected!")
 
                 self.send({"type": "register"})
-
-                # Start reading from server
-                threading.Thread(target=self.reader, daemon=True).start()
-
-                # Initial work request
                 self.send({"type": "request_work"})
 
-                # Keep alive until stop
+                threading.Thread(target=self.reader, daemon=True).start()
+
                 while not self.stop_event.is_set() and self.sock:
-                    time.sleep(1)
+                    time.sleep(0.5)
 
             except Exception as e:
-                print(f"[!] Connection lost: {e}")
+                print(f"[!] Connection error: {e}")
                 with self.sock_lock:
                     if self.sock:
                         self.sock.close()
                         self.sock = None
                 time.sleep(3)
+
 
     def reader(self):
         buf = b""
@@ -170,7 +167,7 @@ class Node:
             start = msg["start_idx"]
             end = msg["end_idx"]
             h = msg["hash"]
-            checkpoint_every = msg.get("checkpoint_every", 0)  # This comes from --checkpoint
+            checkpoint_every = msg.get("checkpoint_every", 0)
 
             with self.work_lock:
                 self.current_work = {
@@ -179,21 +176,24 @@ class Node:
                     "hash": h,
                     "checkpoint_every": int(checkpoint_every),
                     "next_idx": int(start),
-                    "last_checkpoint_idx": int(start) - 1  # force first checkpoint if needed
+                    "last_checkpoint_idx": int(start) - 1
                 }
                 self.work_event.set()
 
-            print(f"[+] Work received: {start:,} → {end:,} | checkpoint every {checkpoint_every}")
-
+            print(f"[+] Work received: {start:,} → {end:,}")
+        
         elif typ == "stop":
-            print("[!] Password found elsewherewhere! Stopping.")
+            print("[!] STOP signal received")
             self.stop_event.set()
             with self.work_lock:
                 self.current_work = None
                 self.work_event.clear()
 
+
     def worker(self):
         while not self.stop_event.is_set():
+
+            # Wait for work
             self.work_event.wait(timeout=1)
             if self.stop_event.is_set():
                 break
@@ -206,41 +206,39 @@ class Node:
             if not work:
                 continue
 
+            # ---- Crack the chunk ----
             while not self.stop_event.is_set():
                 with self.work_lock:
                     if self.current_work != work or self.current_work is None:
                         break
+
                     idx = self.current_work["next_idx"]
                     if idx >= work["end"]:
+                        # Done this block
                         self.current_work = None
                         self.work_event.clear()
                         break
+
                     self.current_work["next_idx"] += 1
 
-                idx, guess = get_next_password()
+                guess = idx_to_guess(idx)
+
                 if verify_hash(work["hash"], guess):
-                    print(f"\n[!!!] PASSWORD CRACKED: {guess}\n")
-                    self.send({
-                        "type": "result",
-                        "found": True,
-                        "password": guess
-                    })
+                    print(f"\n[!!!] PASSWORD FOUND: {guess}\n")
+                    self.send({"type": "result", "found": True, "password": guess})
                     self.stop_event.set()
                     return
 
-                # === CHECKPOINT LOGIC ===
+                # Send checkpoint if needed
                 if work["checkpoint_every"] > 0:
                     if (idx - work["last_checkpoint_idx"]) >= work["checkpoint_every"]:
-                        self.send({
-                            "type": "checkpoint",
-                            "last_checked": idx
-                        })
+                        self.send({"type": "checkpoint", "last_checked": idx})
                         with self.work_lock:
                             if self.current_work:
                                 self.current_work["last_checkpoint_idx"] = idx
-                        print(f"[✓] Checkpoint sent @ {idx:,}")
+                        print(f"[✓] Checkpoint @ {idx:,}")
 
-            # Finished this block → request more
+            # ---- Finished → ask server for more work ----
             if not self.stop_event.is_set():
                 self.send({"type": "request_work"})
 
