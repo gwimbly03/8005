@@ -209,8 +209,9 @@ class Node:
             # ---- Crack the chunk ----
             while not self.stop_event.is_set():
                 with self.work_lock:
-                    if self.current_work != work or self.current_work is None:
+                    if self.current_work is None:
                         break
+
 
                     idx = self.current_work["next_idx"]
                     if idx >= work["end"]:
@@ -221,7 +222,7 @@ class Node:
 
                     self.current_work["next_idx"] += 1
 
-                guess = idx_to_guess(idx)
+                guess = idx_to_password(idx)
 
                 if verify_hash(work["hash"], guess):
                     print(f"\n[!!!] PASSWORD FOUND: {guess}\n")
@@ -231,12 +232,13 @@ class Node:
 
                 # Send checkpoint if needed
                 if work["checkpoint_every"] > 0:
-                    if (idx - work["last_checkpoint_idx"]) >= work["checkpoint_every"]:
-                        self.send({"type": "checkpoint", "last_checked": idx})
-                        with self.work_lock:
-                            if self.current_work:
-                                self.current_work["last_checkpoint_idx"] = idx
-                        print(f"[✓] Checkpoint @ {idx:,}")
+                    with self.work_lock:
+                        real = self.current_work
+                        if real and (idx - real["last_checkpoint_idx"]) >= work["checkpoint_every"]:
+                            real["last_checkpoint_idx"] = idx
+                            self.send({"type": "checkpoint", "last_checked": idx})
+                            print(f"[✓] Checkpoint @ {idx:,}")
+
 
             # ---- Finished → ask server for more work ----
             if not self.stop_event.is_set():
