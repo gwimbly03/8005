@@ -189,7 +189,7 @@ class Server:
             self.nodes = [n for n in self.nodes if n.alive]
 
     def health_check(self):
-    """Disconnect nodes that haven't checked in within timeout."""
+        """Disconnect nodes that haven't checked in within timeout."""
     while not found_event.is_set():
         time.sleep(5)
         now = time.time()
