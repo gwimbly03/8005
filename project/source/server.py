@@ -213,6 +213,11 @@ class Server:
         threading.Thread(target=self.length_worker, daemon=True).start()
         threading.Thread(target=self.assigner, daemon=True).start()
         threading.Thread(target=self.health_check, daemon=True).start()
+
+        # TCP listen
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
         try:
             sock.bind(("0.0.0.0", self.args.port))
             sock.listen(50)
