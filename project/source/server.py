@@ -1,269 +1,392 @@
-#!/usr/bin/env python3
-"""
-Distributed password cracking server (per-length assignment).
-Sends start_idx/end_idx offsets within a fixed password LENGTH.
-Requires Python 3.8+.
-"""
 import argparse
 import socket
 import threading
-import json
 import time
-import sys
-import signal
+import queue
+import json
+import logging
+from typing import Dict, List, Tuple, Optional
 
-# Config alphabet -- must match cracker.py CHAR
-# (server doesn't need to import cracker; it only needs base size)
-LEGAL = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789@#%^&*()_+-=.,:;?"
-BASE = len(LEGAL)
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-ATOMIC_START = 0
-atomic_lock = threading.Lock()
-# atomic_counter is an offset within the current length's space
-atomic_counter = ATOMIC_START
+class WorkUnit:
+    def __init__(self, start: int, end: int, assigned_to: str = None):
+        self.start = start
+        self.end = end
+        self.assigned_to = assigned_to
+        self.last_checkpoint = start
+        self.completed = False
 
-found_event = threading.Event()
-
-def debug(msg):
-    print(f"[SDEBUG] {msg}", flush=True)
-
-class NodeConn:
-    def __init__(self, conn, addr, node_id, server):
+class Node:
+    def __init__(self, node_id: str, conn: socket.socket, addr: Tuple[str, int]):
+        self.node_id = node_id
         self.conn = conn
         self.addr = addr
-        self.id = node_id
-        self.server = server
-        self.alive = True
-        self.last_seen = time.time()
-        threading.Thread(target=self.reader, daemon=True).start()
+        self.work_units: List[WorkUnit] = []
+        self.connected = True
+        self.last_heartbeat = time.time()
 
-    def send(self, msg: dict):
+class PasswordCrackingServer:
+    def __init__(self, port: int, target_hash: str, work_size: int, checkpoint_interval: int, timeout: int):
+        self.port = port
+        self.target_hash = target_hash
+        self.work_size = work_size
+        self.checkpoint_interval = checkpoint_interval
+        self.timeout = timeout
+        
+        self.nodes: Dict[str, Node] = {}
+        self.work_queue = queue.Queue()
+        self.completed_work: List[WorkUnit] = []
+        
+        self.found_password = None
+        self.found_event = threading.Event()
+        
+        self.legal_chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789@#%^&*()_+-=.,:;?"
+        self.base = len(self.legal_chars)
+        self.current_length = 1
+        
+        self.server_socket = None
+        self.lock = threading.Lock()
+        
+        # Initialize work for first length
+        self._generate_work_units()
+    
+    def _idx_to_guess(self, idx: int, length: int) -> str:
+        """Convert index to password guess"""
+        chars = []
+        temp_idx = idx
+        for _ in range(length):
+            chars.append(self.legal_chars[temp_idx % self.base])
+            temp_idx //= self.base
+        return ''.join(reversed(chars))
+    
+    def _generate_work_units(self):
+        """Generate work units for current password length"""
+        total_passwords = self.base ** self.current_length
+        
+        for start in range(0, total_passwords, self.work_size):
+            end = min(start + self.work_size, total_passwords)
+            self.work_queue.put(WorkUnit(start, end))
+    
+    def _handle_node_registration(self, conn: socket.socket, addr: Tuple[str, int]):
+        """Handle new node registration"""
         try:
-            data = json.dumps(msg).encode() + b"\n"
-            self.conn.sendall(data)
+            # Receive registration message
+            data = conn.recv(4096).decode('utf-8')
+            if not data:
+                conn.close()
+                return
+            message = json.loads(data)
+            
+            if message.get('type') == 'register':
+                node_id = message['node_id']
+                
+                with self.lock:
+                    node = Node(node_id, conn, addr)
+                    self.nodes[node_id] = node
+                    logger.info(f"Node {node_id} registered from {addr}")
+                
+                # Send initial configuration
+                config_msg = {
+                    'type': 'config',
+                    'target_hash': self.target_hash,
+                    'checkpoint_interval': self.checkpoint_interval
+                }
+                try:
+                    conn.send(json.dumps(config_msg).encode('utf-8'))
+                except Exception as e:
+                    logger.warning(f"Failed to send config to {node_id}: {e}")
+                
+                # Handle messages from this node in a new thread (non-blocking)
+                comm_thread = threading.Thread(target=self._handle_node_communication, args=(node,), daemon=True)
+                comm_thread.start()
+            else:
+                logger.warning(f"Unexpected registration message from {addr}: {message}")
+                conn.close()
+                
         except Exception as e:
-            debug(f"Node#{self.id} send err: {e}")
-            self.alive = False
-
-    def close(self):
-        try:
-            self.conn.close()
-        except Exception:
-            pass
-        self.alive = False
-
-    def reader(self):
-        buf = b""
-        while self.alive and not found_event.is_set():
+            logger.error(f"Error during node registration from {addr}: {e}")
             try:
-                data = self.conn.recv(4096)
+                conn.close()
+            except:
+                pass
+    
+    def _handle_node_communication(self, node: Node):
+        """Handle communication with a specific node"""
+        conn = node.conn
+        try:
+            while node.connected and not self.found_event.is_set():
+                try:
+                    data = conn.recv(4096).decode('utf-8')
+                except ConnectionResetError:
+                    raise
                 if not data:
                     break
-                buf += data
-                while b"\n" in buf:
-                    line, buf = buf.split(b"\n", 1)
-                    if not line.strip():
-                        continue
-                    try:
-                        msg = json.loads(line.decode())
-                    except Exception as e:
-                        debug(f"Node#{self.id} bad json: {e}")
-                        continue
-                    # update last seen
-                    self.last_seen = time.time()
-                    self.server.handle_msg(self, msg)
-            except Exception as e:
-                debug(f"Node#{self.id} reader err: {e}")
-                break
-
-        self.alive = False
-        self.server.remove_node(self)
-
-class Server:
-    def __init__(self, users, args):
-        self.users = users
-        self.args = args
-        self.hash = args.hash
-
-        self.nodes = []
-        # assigned: node_id -> dict with start,end,length,assigned_time
-        self.assigned = {}
-
-        self.lock = threading.Lock()
-        self.node_counter = 0
-
-        # per-length state
-        self.length = 1
-        self.base = BASE
-        self.total_for_length = pow(self.base, self.length)
-        self.atomic_counter = 0  # offset within current length
-
-        # monitor thread
-        self.monitor_thread = threading.Thread(target=self.monitor_nodes, daemon=True)
-        self.monitor_thread.start()
-
-    def _alloc_block(self, work_size):
-        """Return (start, end, length) offsets within current length.
-        Advance to next length when current space exhausted."""
-        with self.lock:
-            # if current counter already exhausted, move to next length
-            while self.atomic_counter >= self.total_for_length:
-                self.length += 1
-                self.total_for_length = pow(self.base, self.length)
-                debug(f"All blocks for length {self.length-1} exhausted. Advancing to length={self.length}")
-
-            start = self.atomic_counter
-            end = min(start + work_size - 1, self.total_for_length - 1)
-            self.atomic_counter = end + 1
-
-            # if we've exhausted the space exactly after this block, the next allocation
-            # will bump length automatically in subsequent calls.
-            return start, end, self.length
-
-    def handle_msg(self, node, msg):
-        t = msg.get("type")
-        node.last_seen = time.time()
-
-        if t == "register":
-            debug(f"[+] Node#{node.id} registered (threads={msg.get('threads')})")
-            return
-
-        if t == "request_work":
-            if found_event.is_set():
-                node.send({"type": "stop"})
-                return
-
-            start, end, length = self._alloc_block(self.args.work_size)
-            assigned_time = time.time()
-
+                
+                try:
+                    message = json.loads(data)
+                except json.JSONDecodeError as e:
+                    logger.warning(f"JSON decode error from {node.node_id}: {e}")
+                    # ignore this message and continue
+                    continue
+                
+                self._process_node_message(node, message)
+                
+        except (ConnectionResetError, ConnectionAbortedError) as e:
+            logger.warning(f"Connection with node {node.node_id} lost: {e}")
+        finally:
+            self._handle_node_disconnection(node.node_id)
+    
+    def _process_node_message(self, node: Node, message: dict):
+        """Process message from node"""
+        msg_type = message.get('type')
+        
+        if msg_type == 'heartbeat':
+            node.last_heartbeat = time.time()
+            logger.debug(f"Heartbeat from {node.node_id}")
+            
+        elif msg_type == 'checkpoint':
+            work_id = message['work_id']
+            checkpoint_pos = message['checkpoint']
+            
             with self.lock:
-                self.assigned[node.id] = {
-                    "start": start,
-                    "end": end,
-                    "length": length,
-                    "assigned_time": assigned_time,
-                }
-
-            node.send({
-                "type": "work",
-                "start_idx": start,
-                "end_idx": end,
-                "length": length,
-                "hash": self.hash,
-                "checkpoint": self.args.checkpoint,
-                "timeout": self.args.timeout,
-                "assigned_time": assigned_time,
-                "username": self.users[0][0] if self.users else None
-            })
-            debug(f"[+] Assigned Node#{node.id} len={length} work {start}–{end}")
-            return
-
-        if t == "progress" or t == "heartbeat":
-            # optional: log or update metrics
-            if t == "progress":
-                debug(f"[ ] Progress Node#{node.id}: {msg.get('current')}")
-            return
-
-        if t == "result":
-            # remove assignment
+                for work_unit in node.work_units:
+                    if work_unit.start == work_id:
+                        work_unit.last_checkpoint = checkpoint_pos
+                        logger.info(f"Node {node.node_id} checkpoint at {checkpoint_pos} for work {work_id}")
+                        break
+        
+        elif msg_type == 'work_request':
+            self._assign_work_to_node(node)
+        
+        elif msg_type == 'password_found':
+            password = message['password']
+            work_id = message['work_id']
+            
             with self.lock:
-                if node.id in self.assigned:
-                    self.assigned.pop(node.id, None)
-
-            if msg.get("found"):
-                debug(f"\n[+] Node#{node.id} cracked it! Password = {msg.get('password')}\n")
-                found_event.set()
-                self.broadcast_stop()
-            else:
-                debug(f"[ ] Node#{node.id} reported not found for assigned block")
-            return
-
-        debug(f"[?] Node#{node.id} unknown msg: {t}")
-
-    def broadcast_stop(self):
-        with self.lock:
-            for n in list(self.nodes):
-                if n.alive:
-                    try:
-                        n.send({"type": "stop"})
-                    except Exception:
-                        pass
-
-    def remove_node(self, node):
-        with self.lock:
-            debug(f"[-] Node#{node.id} disconnected")
-            if node.id in self.assigned:
-                debug(f"    Reclaiming block assigned to Node#{node.id} (dropping; counter advanced)")
-                del self.assigned[node.id]
-            self.nodes = [n for n in self.nodes if n is not node]
+                # If already found by another node, ignore
+                if not self.found_event.is_set():
+                    self.found_password = password
+                    self.found_event.set()
+                    
+                    # Mark the specific work unit as completed
+                    for work_unit in node.work_units:
+                        if work_unit.start == work_id:
+                            work_unit.completed = True
+                            break
+                
+                logger.info(f"Password found by node {node.node_id}: {password}")
+            
+            # Notify all nodes to stop
+            self._broadcast_stop_message()
+        
+        elif msg_type == 'work_completed':
+            work_id = message['work_id']
+            
+            with self.lock:
+                # Mark work unit as completed
+                for work_unit in list(node.work_units):
+                    if work_unit.start == work_id:
+                        work_unit.completed = True
+                        self.completed_work.append(work_unit)
+                        try:
+                            node.work_units.remove(work_unit)
+                        except ValueError:
+                            pass
+                        break
+            
+            logger.info(f"Node {node.node_id} completed work {work_id}")
+        else:
+            logger.warning(f"Unknown message type from {node.node_id}: {msg_type}")
+    
+    def _assign_work_to_node(self, node: Node):
+        """Assign work to a node"""
+        if self.found_event.is_set():
+            # Send stop message if password found
+            stop_msg = {'type': 'stop'}
             try:
-                node.close()
+                node.conn.send(json.dumps(stop_msg).encode('utf-8'))
             except Exception:
                 pass
-
-    def monitor_nodes(self):
-        while not found_event.is_set():
-            now = time.time()
-            to_remove = []
-            with self.lock:
-                for n in list(self.nodes):
-                    if not n.alive:
-                        to_remove.append(n)
-                        continue
-                    if self.args.timeout and (now - n.last_seen) > self.args.timeout:
-                        debug(f"[!] Node#{n.id} timed out (last seen {now - n.last_seen:.1f}s ago)")
-                        to_remove.append(n)
-            for n in to_remove:
+            return
+        
+        work_unit = None
+        
+        with self.lock:
+            # Try to get work from queue
+            try:
+                work_unit = self.work_queue.get_nowait()
+            except queue.Empty:
+                # No work in current length, check if we need to move to next length
+                if self.work_queue.empty() and not self.found_event.is_set():
+                    self.current_length += 1
+                    if self.current_length <= 8:  # Arbitrary limit
+                        logger.info(f"Moving to password length {self.current_length}")
+                        self._generate_work_units()
+                        try:
+                            work_unit = self.work_queue.get_nowait()
+                        except queue.Empty:
+                            work_unit = None
+        
+        if work_unit:
+            work_unit.assigned_to = node.node_id
+            node.work_units.append(work_unit)
+            
+            work_msg = {
+                'type': 'work_assignment',
+                'work_id': work_unit.start,
+                'start': work_unit.last_checkpoint,
+                'end': work_unit.end,
+                'length': self.current_length
+            }
+            try:
+                node.conn.send(json.dumps(work_msg).encode('utf-8'))
+                logger.info(f"Assigned work {work_unit.start}-{work_unit.end} to node {node.node_id}")
+            except Exception as e:
+                logger.warning(f"Failed to send work assignment to {node.node_id}: {e}")
+                # If send fails, requeue the work
+                with self.lock:
+                    new_work = WorkUnit(work_unit.last_checkpoint, work_unit.end)
+                    self.work_queue.put(new_work)
+                    try:
+                        node.work_units.remove(work_unit)
+                    except ValueError:
+                        pass
+        else:
+            # No work available
+            no_work_msg = {'type': 'no_work'}
+            try:
+                node.conn.send(json.dumps(no_work_msg).encode('utf-8'))
+            except Exception:
+                pass
+    
+    def _handle_node_disconnection(self, node_id: str):
+        """Handle node disconnection and redistribute work"""
+        with self.lock:
+            if node_id in self.nodes:
+                node = self.nodes[node_id]
+                node.connected = False
+                
+                logger.info(f"Node {node_id} disconnected")
+                
+                # Redistribute unfinished work
+                for work_unit in node.work_units:
+                    if not work_unit.completed:
+                        # Create new work unit from last checkpoint
+                        new_work = WorkUnit(work_unit.last_checkpoint, work_unit.end)
+                        self.work_queue.put(new_work)
+                        logger.info(f"Requeued work {work_unit.last_checkpoint}-{work_unit.end} from disconnected node {node_id}")
+                
+                # Remove node
                 try:
-                    n.send({"type": "stop"})
-                except Exception:
+                    del self.nodes[node_id]
+                except KeyError:
                     pass
-                self.remove_node(n)
-            time.sleep(1)
-
-    def start(self):
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind(("0.0.0.0", self.args.port))
-        sock.listen(50)
-
-        debug(f"[*] Listening on port {self.args.port}")
-
-        try:
-            while not found_event.is_set():
+    
+    def _broadcast_stop_message(self):
+        """Broadcast stop message to all nodes"""
+        stop_msg = {'type': 'stop'}
+        
+        with self.lock:
+            for node_id, node in list(self.nodes.items()):
                 try:
-                    conn, addr = sock.accept()
-                    with self.lock:
-                        n = NodeConn(conn, addr, self.node_counter, self)
-                        self.nodes.append(n)
-                        self.node_counter += 1
-                    debug(f"[+] Connection from {addr[0]}:{addr[1]}")
-                except KeyboardInterrupt:
-                    break
+                    node.conn.send(json.dumps(stop_msg).encode('utf-8'))
+                except Exception:
+                    pass  # Node might already be disconnected
+    
+    def _monitor_nodes(self):
+        """Monitor nodes for timeouts"""
+        while not self.found_event.is_set():
+            time.sleep(10)  # Check every 10 seconds
+            
+            current_time = time.time()
+            disconnected_nodes = []
+            
+            with self.lock:
+                for node_id, node in list(self.nodes.items()):
+                    if current_time - node.last_heartbeat > self.timeout:
+                        logger.warning(f"Node {node_id} timed out")
+                        disconnected_nodes.append(node_id)
+            
+            for node_id in disconnected_nodes:
+                self._handle_node_disconnection(node_id)
+    
+    def start(self):
+        """Start the server"""
+        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        # set a short timeout so accept() can be interrupted by signals and loops can check found_event
+        self.server_socket.settimeout(1.0)
+        self.server_socket.bind(('0.0.0.0', self.port))
+        self.server_socket.listen(10)
+        
+        logger.info(f"Server started on port {self.port}")
+        logger.info(f"Target hash: {self.target_hash}")
+        logger.info(f"Work size: {self.work_size}")
+        logger.info(f"Checkpoint interval: {self.checkpoint_interval}")
+        logger.info(f"Timeout: {self.timeout}")
+        
+        # Start node monitoring thread
+        monitor_thread = threading.Thread(target=self._monitor_nodes, daemon=True)
+        monitor_thread.start()
+        
+        try:
+            while not self.found_event.is_set():
+                try:
+                    conn, addr = self.server_socket.accept()
+                    
+                    # Handle the registration/initial message in a thread so accept loop isn't blocked
+                    reg_thread = threading.Thread(
+                        target=self._handle_node_registration,
+                        args=(conn, addr),
+                        daemon=True
+                    )
+                    reg_thread.start()
+                    
+                except socket.timeout:
+                    continue
                 except Exception as e:
-                    debug(f"[!] accept error: {e}")
+                    logger.error(f"Accept error: {e}")
+                    continue
+                
+        except KeyboardInterrupt:
+            logger.info("Server shutdown requested")
         finally:
-            sock.close()
-
+            self.found_event.set()
+            try:
+                self.server_socket.close()
+            except:
+                pass
+            
+            if self.found_password:
+                print("#" * 50)
+                print(f"PASSWORD FOUND: {self.found_password}")
+                print("#" * 50)
+            else:
+                print("Password not found")
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--port", type=int, default=5000)
-    parser.add_argument("--hash", required=True, help="Password hash to crack")
-    parser.add_argument("--work-size", type=int, default=1000, help="number of offsets per worker block")
-    parser.add_argument("--checkpoint", type=int, default=500)
-    parser.add_argument("--timeout", type=int, default=600)
-
+    parser = argparse.ArgumentParser(description="Distributed Password Cracking Server")
+    parser.add_argument("--port", type=int, required=True, help="Port the server listens on")
+    parser.add_argument("--hash", type=str, required=True, help="Hashed password to crack")
+    parser.add_argument("--work-size", type=int, default=1000, help="Number of passwords assigned per node request")
+    parser.add_argument("--checkpoint", type=int, default=500, help="Number of attempts before a node sends a checkpoint")
+    parser.add_argument("--timeout", type=int, default=600, help="Number of seconds to wait for a checkpoint from a client")
+    
     args = parser.parse_args()
-
-    users = [("target", args.hash)]
-
-    global server
-    server = Server(users, args)
+    
+    server = PasswordCrackingServer(
+        port=args.port,
+        target_hash=args.hash,
+        work_size=args.work_size,
+        checkpoint_interval=args.checkpoint,
+        timeout=args.timeout
+    )
+    
     server.start()
 
-
 if __name__ == "__main__":
-    signal.signal(signal.SIGINT, lambda s, f: sys.exit(0))
     main()
 
