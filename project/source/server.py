@@ -2,390 +2,326 @@ import argparse
 import socket
 import threading
 import time
-import queue
 import json
 import logging
-from typing import Dict, List, Tuple, Optional
+import queue
+from typing import Dict, List, Tuple
 
-# Set up logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger("server")
 
 class WorkUnit:
-    def __init__(self, start: int, end: int, assigned_to: str = None):
+    def __init__(self, start: int, end: int):
         self.start = start
         self.end = end
-        self.assigned_to = assigned_to
         self.last_checkpoint = start
+        self.assigned_to = None
         self.completed = False
 
+
 class Node:
-    def __init__(self, node_id: str, conn: socket.socket, addr: Tuple[str, int]):
-        self.node_id = node_id
+    def __init__(self, node_id: str, conn: socket.socket, addr):
+        self.id = node_id
         self.conn = conn
         self.addr = addr
-        self.work_units: List[WorkUnit] = []
-        self.connected = True
+        self.work: List[WorkUnit] = []
         self.last_heartbeat = time.time()
+        self.connected = True
+
+def recv_lines(sock, buffer):
+    try:
+        data = sock.recv(4096).decode("utf-8")
+    except socket.timeout:
+        return [], buffer
+    except Exception:
+        raise
+
+    if not data:
+        raise ConnectionResetError("client disconnected")
+
+    buffer += data
+    msgs = []
+
+    while "\n" in buffer:
+        line, buffer = buffer.split("\n", 1)
+        if line.strip():
+            msgs.append(line)
+
+    return msgs, buffer
+
+
+def send_json(sock, obj):
+    try:
+        sock.send((json.dumps(obj) + "\n").encode("utf-8"))
+    except Exception:
+        pass
 
 class PasswordCrackingServer:
-    def __init__(self, port: int, target_hash: str, work_size: int, checkpoint_interval: int, timeout: int):
+    def __init__(self, port, target_hash, work_size, checkpoint_interval, timeout):
         self.port = port
+        self.target_instance = target_hash
         self.target_hash = target_hash
         self.work_size = work_size
         self.checkpoint_interval = checkpoint_interval
         self.timeout = timeout
-        
-        self.nodes: Dict[str, Node] = {}
-        self.work_queue = queue.Queue()
-        self.completed_work: List[WorkUnit] = []
-        
-        self.found_password = None
-        self.found_event = threading.Event()
-        
+
         self.legal_chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789@#%^&*()_+-=.,:;?"
         self.base = len(self.legal_chars)
         self.current_length = 1
-        
-        self.server_socket = None
+
+        self.nodes: Dict[str, Node] = {}
+        self.work_queue = queue.Queue()
         self.lock = threading.Lock()
-        
-        # Initialize work for first length
+
+        self.found_password = None
+        self.stop_event = threading.Event()
+
         self._generate_work_units()
-    
-    def _idx_to_guess(self, idx: int, length: int) -> str:
-        """Convert index to password guess"""
-        chars = []
-        temp_idx = idx
-        for _ in range(length):
-            chars.append(self.legal_chars[temp_idx % self.base])
-            temp_idx //= self.base
-        return ''.join(reversed(chars))
-    
+
     def _generate_work_units(self):
-        """Generate work units for current password length"""
-        total_passwords = self.base ** self.current_length
-        
-        for start in range(0, total_passwords, self.work_size):
-            end = min(start + self.work_size, total_passwords)
+        total = self.base ** self.current_length
+        for start in range(0, total, self.work_size):
+            end = min(start + self.work_size, total)
             self.work_queue.put(WorkUnit(start, end))
-    
-    def _handle_node_registration(self, conn: socket.socket, addr: Tuple[str, int]):
-        """Handle new node registration"""
-        try:
-            # Receive registration message
-            data = conn.recv(4096).decode('utf-8')
-            if not data:
-                conn.close()
-                return
-            message = json.loads(data)
-            
-            if message.get('type') == 'register':
-                node_id = message['node_id']
-                
-                with self.lock:
-                    node = Node(node_id, conn, addr)
-                    self.nodes[node_id] = node
-                    logger.info(f"Node {node_id} registered from {addr}")
-                
-                # Send initial configuration
-                config_msg = {
-                    'type': 'config',
-                    'target_hash': self.target_hash,
-                    'checkpoint_interval': self.checkpoint_interval
-                }
-                try:
-                    conn.send(json.dumps(config_msg).encode('utf-8'))
-                except Exception as e:
-                    logger.warning(f"Failed to send config to {node_id}: {e}")
-                
-                # Handle messages from this node in a new thread (non-blocking)
-                comm_thread = threading.Thread(target=self._handle_node_communication, args=(node,), daemon=True)
-                comm_thread.start()
-            else:
-                logger.warning(f"Unexpected registration message from {addr}: {message}")
-                conn.close()
-                
-        except Exception as e:
-            logger.error(f"Error during node registration from {addr}: {e}")
-            try:
-                conn.close()
-            except:
-                pass
-    
-    def _handle_node_communication(self, node: Node):
-        """Handle communication with a specific node"""
+
+        logger.info(f"Generated work for length={self.current_length} total={total}")
+
+    def _handle_node(self, node: Node):
+        buffer = ""
         conn = node.conn
-        try:
-            while node.connected and not self.found_event.is_set():
-                try:
-                    data = conn.recv(4096).decode('utf-8')
-                except ConnectionResetError:
-                    raise
-                if not data:
-                    break
-                
-                try:
-                    message = json.loads(data)
-                except json.JSONDecodeError as e:
-                    logger.warning(f"JSON decode error from {node.node_id}: {e}")
-                    # ignore this message and continue
-                    continue
-                
-                self._process_node_message(node, message)
-                
-        except (ConnectionResetError, ConnectionAbortedError) as e:
-            logger.warning(f"Connection with node {node.node_id} lost: {e}")
-        finally:
-            self._handle_node_disconnection(node.node_id)
-    
-    def _process_node_message(self, node: Node, message: dict):
-        """Process message from node"""
-        msg_type = message.get('type')
-        
-        if msg_type == 'heartbeat':
-            node.last_heartbeat = time.time()
-            logger.debug(f"Heartbeat from {node.node_id}")
-            
-        elif msg_type == 'checkpoint':
-            work_id = message['work_id']
-            checkpoint_pos = message['checkpoint']
-            
-            with self.lock:
-                for work_unit in node.work_units:
-                    if work_unit.start == work_id:
-                        work_unit.last_checkpoint = checkpoint_pos
-                        logger.info(f"Node {node.node_id} checkpoint at {checkpoint_pos} for work {work_id}")
-                        break
-        
-        elif msg_type == 'work_request':
-            self._assign_work_to_node(node)
-        
-        elif msg_type == 'password_found':
-            password = message['password']
-            work_id = message['work_id']
-            
-            with self.lock:
-                # If already found by another node, ignore
-                if not self.found_event.is_set():
-                    self.found_password = password
-                    self.found_event.set()
-                    
-                    # Mark the specific work unit as completed
-                    for work_unit in node.work_units:
-                        if work_unit.start == work_id:
-                            work_unit.completed = True
-                            break
-                
-                logger.info(f"Password found by node {node.node_id}: {password}")
-            
-            # Notify all nodes to stop
-            self._broadcast_stop_message()
-        
-        elif msg_type == 'work_completed':
-            work_id = message['work_id']
-            
-            with self.lock:
-                # Mark work unit as completed
-                for work_unit in list(node.work_units):
-                    if work_unit.start == work_id:
-                        work_unit.completed = True
-                        self.completed_work.append(work_unit)
-                        try:
-                            node.work_units.remove(work_unit)
-                        except ValueError:
-                            pass
-                        break
-            
-            logger.info(f"Node {node.node_id} completed work {work_id}")
-        else:
-            logger.warning(f"Unknown message type from {node.node_id}: {msg_type}")
-    
-    def _assign_work_to_node(self, node: Node):
-        """Assign work to a node"""
-        if self.found_event.is_set():
-            # Send stop message if password found
-            stop_msg = {'type': 'stop'}
+        conn.settimeout(1.0)
+
+        while not self.stop_event.is_set() and node.connected:
             try:
-                node.conn.send(json.dumps(stop_msg).encode('utf-8'))
+                msgs, buffer = recv_lines(conn, buffer)
             except Exception:
-                pass
+                logger.warning(f"Node {node.id} disconnected.")
+                break
+
+            for raw in msgs:
+                try:
+                    msg = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+
+                self._process_message(node, msg)
+
+        self._handle_disconnection(node.id)
+
+    def _process_message(self, node: Node, msg: dict):
+        t = msg.get("type")
+
+        if t == "heartbeat":
+            node.last_heartbeat = time.time()
+
+        elif t == "checkpoint":
+            wid = msg["work_id"]
+            chk = msg["checkpoint"]
+
+            with self.lock:
+                for w in node.work:
+                    if w.start == wid:
+                        w.last_checkpoint = chk
+                        break
+
+        elif t == "work_request":
+            self._assign_work(node)
+
+        elif t == "password_found":
+            pw = msg["password"]
+            wid = msg["work_id"]
+
+            with self.lock:
+                self.found_password = pw
+                self.stop_event.set()
+                logger.info(f"!!! PASSWORD FOUND by {node.id}: {pw}")
+
+            self._broadcast({"type": "stop"})
+
+        elif t == "work_completed":
+            wid = msg["work_id"]
+
+            with self.lock:
+                for w in node.work:
+                    if w.start == wid:
+                        w.completed = True
+                        node.work.remove(w)
+                        break
+
+    def _assign_work(self, node: Node):
+        if self.stop_event.is_set():
+            send_json(node.conn, {"type": "stop"})
             return
-        
-        work_unit = None
-        
+
+        work = None
+
         with self.lock:
-            # Try to get work from queue
             try:
-                work_unit = self.work_queue.get_nowait()
+                work = self.work_queue.get_nowait()
             except queue.Empty:
-                # No work in current length, check if we need to move to next length
-                if self.work_queue.empty() and not self.found_event.is_set():
+                if self.work_queue.empty():
                     self.current_length += 1
-                    if self.current_length <= 8:  # Arbitrary limit
-                        logger.info(f"Moving to password length {self.current_length}")
+                    if self.current_length <= 8:
+                        logger.info(f"Moving to length {self.current_length}")
                         self._generate_work_units()
                         try:
-                            work_unit = self.work_queue.get_nowait()
+                            work = self.work_queue.get_nowait()
                         except queue.Empty:
-                            work_unit = None
-        
-        if work_unit:
-            work_unit.assigned_to = node.node_id
-            node.work_units.append(work_unit)
-            
-            work_msg = {
-                'type': 'work_assignment',
-                'work_id': work_unit.start,
-                'start': work_unit.last_checkpoint,
-                'end': work_unit.end,
-                'length': self.current_length
+                            pass
+
+        if work:
+            work.assigned_to = node.id
+            node.work.append(work)
+
+            msg = {
+                "type": "work_assignment",
+                "work_id": work.start,
+                "start": work.last_checkpoint,
+                "end": work.end,
+                "length": self.current_length,
             }
-            try:
-                node.conn.send(json.dumps(work_msg).encode('utf-8'))
-                logger.info(f"Assigned work {work_unit.start}-{work_unit.end} to node {node.node_id}")
-            except Exception as e:
-                logger.warning(f"Failed to send work assignment to {node.node_id}: {e}")
-                # If send fails, requeue the work
-                with self.lock:
-                    new_work = WorkUnit(work_unit.last_checkpoint, work_unit.end)
-                    self.work_queue.put(new_work)
-                    try:
-                        node.work_units.remove(work_unit)
-                    except ValueError:
-                        pass
+            send_json(node.conn, msg)
+
         else:
-            # No work available
-            no_work_msg = {'type': 'no_work'}
-            try:
-                node.conn.send(json.dumps(no_work_msg).encode('utf-8'))
-            except Exception:
-                pass
-    
-    def _handle_node_disconnection(self, node_id: str):
-        """Handle node disconnection and redistribute work"""
+            send_json(node.conn, {"type": "no_work"})
+
+    def _handle_disconnection(self, node_id: str):
         with self.lock:
-            if node_id in self.nodes:
-                node = self.nodes[node_id]
-                node.connected = False
-                
-                logger.info(f"Node {node_id} disconnected")
-                
-                # Redistribute unfinished work
-                for work_unit in node.work_units:
-                    if not work_unit.completed:
-                        # Create new work unit from last checkpoint
-                        new_work = WorkUnit(work_unit.last_checkpoint, work_unit.end)
-                        self.work_queue.put(new_work)
-                        logger.info(f"Requeued work {work_unit.last_checkpoint}-{work_unit.end} from disconnected node {node_id}")
-                
-                # Remove node
-                try:
-                    del self.nodes[node_id]
-                except KeyError:
-                    pass
-    
-    def _broadcast_stop_message(self):
-        """Broadcast stop message to all nodes"""
-        stop_msg = {'type': 'stop'}
-        
-        with self.lock:
-            for node_id, node in list(self.nodes.items()):
-                try:
-                    node.conn.send(json.dumps(stop_msg).encode('utf-8'))
-                except Exception:
-                    pass  # Node might already be disconnected
-    
-    def _monitor_nodes(self):
-        """Monitor nodes for timeouts"""
-        while not self.found_event.is_set():
-            time.sleep(10)  # Check every 10 seconds
-            
-            current_time = time.time()
-            disconnected_nodes = []
-            
-            with self.lock:
-                for node_id, node in list(self.nodes.items()):
-                    if current_time - node.last_heartbeat > self.timeout:
-                        logger.warning(f"Node {node_id} timed out")
-                        disconnected_nodes.append(node_id)
-            
-            for node_id in disconnected_nodes:
-                self._handle_node_disconnection(node_id)
-    
-    def start(self):
-        """Start the server"""
-        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        # set a short timeout so accept() can be interrupted by signals and loops can check found_event
-        self.server_socket.settimeout(1.0)
-        self.server_socket.bind(('0.0.0.0', self.port))
-        self.server_socket.listen(10)
-        
-        logger.info(f"Server started on port {self.port}")
-        logger.info(f"Target hash: {self.target_hash}")
-        logger.info(f"Work size: {self.work_size}")
-        logger.info(f"Checkpoint interval: {self.checkpoint_interval}")
-        logger.info(f"Timeout: {self.timeout}")
-        
-        # Start node monitoring thread
-        monitor_thread = threading.Thread(target=self._monitor_nodes, daemon=True)
-        monitor_thread.start()
-        
-        try:
-            while not self.found_event.is_set():
-                try:
-                    conn, addr = self.server_socket.accept()
-                    
-                    # Handle the registration/initial message in a thread so accept loop isn't blocked
-                    reg_thread = threading.Thread(
-                        target=self._handle_node_registration,
-                        args=(conn, addr),
-                        daemon=True
+            if node_id not in self.nodes:
+                return
+
+            node = self.nodes[node_id]
+            node.connected = False
+
+            logger.warning(f"Node {node_id} cleanup starting...")
+
+            for w in node.work:
+                if not w.completed:
+                    self.work_queue.put(
+                        WorkUnit(w.last_checkpoint, w.end)
                     )
-                    reg_thread.start()
-                    
-                except socket.timeout:
-                    continue
-                except Exception as e:
-                    logger.error(f"Accept error: {e}")
-                    continue
-                
-        except KeyboardInterrupt:
-            logger.info("Server shutdown requested")
-        finally:
-            self.found_event.set()
+                    logger.info(
+                        f"Requeued {w.last_checkpoint}-{w.end} from {node_id}"
+                    )
+
+            del self.nodes[node_id]
+
+    def _broadcast(self, msg):
+        with self.lock:
+            for node in self.nodes.values():
+                send_json(node.conn, msg)
+
+    def _monitor(self):
+        while not self.stop_event.is_set():
+            now = time.time()
+
+            dead = []
+            with self.lock:
+                for nid, node in self.nodes.items():
+                    if now - node.last_heartbeat > self.timeout:
+                        dead.append(nid)
+
+            for nid in dead:
+                logger.warning(f"Heartbeat timeout: {nid}")
+                self._handle_disconnection(nid)
+
+            time.sleep(2)
+
+    def start(self):
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("0.0.0.0", self.port))
+        s.listen(100)
+
+        s.settimeout(1.0)
+
+        logger.info(f"Server listening on port {self.port}")
+
+        threading.Thread(target=self._monitor, daemon=True).start()
+
+        while not self.stop_event.is_set():
             try:
-                self.server_socket.close()
+                conn, addr = s.accept()
+            except socket.timeout:
+                if self.stop_event.is_set():
+                    break
+                continue
+            except KeyboardInterrupt:
+                logger.info("CTRL+C received — stopping server...")
+                self.stop_event.set()
+                break
+
+            buffer = ""
+            msgs, buffer = recv_lines(conn, buffer)
+
+            if not msgs:
+                conn.close()
+                continue
+
+            try:
+                reg = json.loads(msgs[0])
             except:
-                pass
-            
-            if self.found_password:
-                print("#" * 50)
-                print(f"PASSWORD FOUND: {self.found_password}")
-                print("#" * 50)
-            else:
-                print("Password not found")
+                conn.close()
+                continue
+
+            if reg.get("type") != "register":
+                conn.close()
+                continue
+
+            node_id = reg["node_id"]
+
+            node = Node(node_id, conn, addr)
+            with self.lock:
+                self.nodes[node_id] = node
+
+            logger.info(f"Node registered: {node_id} from {addr}")
+
+            send_json(conn, {
+                "type": "config",
+                "target_hash": self.target_hash,
+                "checkpoint_interval": self.checkpoint_interval
+            })
+
+            threading.Thread(
+                target=self._handle_node, args=(node,), daemon=True
+            ).start()
+
+        s.close()
+
+        if self.found_password:
+            print("\n" + "#" * 60)
+            print("PASSWORD FOUND:", self.found_password)
+            print("#" * 60)
+        else:
+            print("No password found.")
 
 def main():
-    parser = argparse.ArgumentParser(description="Distributed Password Cracking Server")
-    parser.add_argument("--port", type=int, required=True, help="Port the server listens on")
-    parser.add_argument("--hash", type=str, required=True, help="Hashed password to crack")
-    parser.add_argument("--work-size", type=int, default=1000, help="Number of passwords assigned per node request")
-    parser.add_argument("--checkpoint", type=int, default=500, help="Number of attempts before a node sends a checkpoint")
-    parser.add_argument("--timeout", type=int, default=600, help="Number of seconds to wait for a checkpoint from a client")
-    
-    args = parser.parse_args()
-    
-    server = PasswordCrackingServer(
-        port=args.port,
-        target_hash=args.hash,
-        work_size=args.work_size,
-        checkpoint_interval=args.checkpoint,
-        timeout=args.timeout
+    p = argparse.ArgumentParser()
+    p.add_argument("--port", type=int, required=True)
+    p.add_argument("--hash", type=str, required=True)
+    p.add_argument("--work-size", type=int, default=2000)
+    p.add_argument("--checkpoint", type=int, default=600)
+    p.add_argument("--timeout", type=int, default=600)
+
+    a = p.parse_args()
+
+    srv = PasswordCrackingServer(
+        port=a.port,
+        target_hash=a.hash,
+        work_size=a.work_size,
+        checkpoint_interval=a.checkpoint,
+        timeout=a.timeout,
     )
-    
-    server.start()
+
+    try:
+        srv.start()
+    except KeyboardInterrupt:
+        logger.info("CTRL+C received — shutting down...")
+        srv.stop_event.set()
+
 
 if __name__ == "__main__":
     main()
