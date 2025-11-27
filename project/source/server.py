@@ -74,7 +74,6 @@ class PasswordCrackingServer:
         self.work_queue = queue.Queue()
         self.lock = threading.Lock()
 
-        # Map from work.start -> WorkUnit for quick lookup (optional)
         self.assigned_index: Dict[int, WorkUnit] = {}
 
         self.found_password = None
@@ -91,7 +90,6 @@ class PasswordCrackingServer:
         logger.info(f"Generated work for length={self.current_length} total={total}")
 
     def _try_assign_to_node(self, node: Node):
-        """Try to assign a work unit to this node if it has none."""
         if self.stop_event.is_set() or not node.connected:
             return False
 
@@ -102,6 +100,7 @@ class PasswordCrackingServer:
 
         work.assigned_to = node.id
         node.work.append(work)
+
         with self.lock:
             self.assigned_index[work.start] = work
 
@@ -149,7 +148,6 @@ class PasswordCrackingServer:
             chk = msg["checkpoint"]
 
             with self.lock:
-                # Update node.work and assigned index if present
                 for w in node.work:
                     if w.start == wid:
                         w.last_checkpoint = chk
@@ -182,13 +180,11 @@ class PasswordCrackingServer:
                             node.work.remove(w)
                         except ValueError:
                             pass
-                        # also remove from assigned index
                         if wid in self.assigned_index:
                             del self.assigned_index[wid]
                         break
 
     def _assign_work(self, node: Node):
-        """Assign work using the shared queue; if none, possibly extend length."""
         if self.stop_event.is_set():
             send_json(node.conn, {"type": "stop"})
             return
@@ -199,7 +195,6 @@ class PasswordCrackingServer:
             try:
                 work = self.work_queue.get_nowait()
             except queue.Empty:
-                # If queue empty, attempt to generate next-length work immediately
                 if self.work_queue.empty():
                     self.current_length += 1
                     if self.current_length <= 8:
@@ -229,7 +224,6 @@ class PasswordCrackingServer:
             send_json(node.conn, {"type": "no_work"})
 
     def _handle_disconnection(self, node_id: str):
-        """Requeue unfinished work for node and try to immediately assign to idle nodes."""
         with self.lock:
             if node_id not in self.nodes:
                 return
@@ -240,34 +234,33 @@ class PasswordCrackingServer:
             logger.warning(f"Node {node_id} cleanup starting...")
 
             requeued = 0
-            # Requeue unfinished work units
+
             for w in node.work:
                 if not w.completed:
-                    # Create a new WorkUnit from last_checkpoint -> end to avoid duplicating original object state
                     re = WorkUnit(w.last_checkpoint, w.end)
-                    # make sure assigned_index doesn't keep stale entries
+
                     if w.start in self.assigned_index:
                         try:
                             del self.assigned_index[w.start]
                         except KeyError:
                             pass
+
                     self.work_queue.put(re)
                     requeued += 1
                     logger.info(f"Requeued {re.last_checkpoint}-{re.end} from {node_id}")
 
-            # Remove node
             del self.nodes[node_id]
             logger.info(f"Node {node_id} removed. Requeued {requeued} chunk(s).")
 
-            # Immediately try to assign requeued work to any idle nodes
-            # (do this while still holding lock to avoid races with assignments)
+            # 🔥 NEW: Tell all remaining workers to request work immediately
+            if requeued > 0:
+                self._broadcast({"type": "work_available"})
+
             if not self.work_queue.empty():
                 for nid, other in list(self.nodes.items()):
-                    # skip busy or disconnected nodes
                     if not other.connected:
                         continue
                     if len(other.work) == 0:
-                        # try to assign one chunk per idle node
                         try:
                             work_candidate: WorkUnit = self.work_queue.get_nowait()
                         except queue.Empty:
@@ -311,7 +304,6 @@ class PasswordCrackingServer:
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind(("0.0.0.0", self.port))
         s.listen(100)
-
         s.settimeout(1.0)
 
         logger.info(f"Server listening on port {self.port}")

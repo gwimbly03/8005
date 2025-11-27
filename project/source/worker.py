@@ -154,6 +154,7 @@ class PasswordCrackingWorker:
                     if window_elapsed > 0:
                         attempts_per_sec = self.total_attempts / window_elapsed
                         logger.debug(f"Throughput {attempts_per_sec:.1f} attempts/sec")
+
         if not self.stop_event.is_set():
             completed_msg = {'type': 'work_completed', 'work_id': work_id}
             self.send_json(completed_msg)
@@ -171,11 +172,12 @@ class PasswordCrackingWorker:
 
     def _process_server_message(self, message: dict):
         msg_type = message.get('type')
+
         if msg_type == 'config':
             self.checkpoint_interval = message.get('checkpoint_interval', self.checkpoint_interval)
             self.target_hash = message.get('target_hash', self.target_hash)
             logger.info(f"Received config: checkpoint={self.checkpoint_interval}")
-            self.no_work_delay = 1  # reset
+            self.no_work_delay = 1  
             self.send_json({'type': 'work_request'})
 
         elif msg_type == 'work_assignment':
@@ -195,6 +197,7 @@ class PasswordCrackingWorker:
             base_chunk = total // self.num_threads if self.num_threads > 0 else total
             if base_chunk == 0:
                 base_chunk = total
+
             for i in range(self.num_threads):
                 t_start = start + i * base_chunk
                 t_end = t_start + base_chunk if i < self.num_threads - 1 else end
@@ -224,6 +227,12 @@ class PasswordCrackingWorker:
         elif msg_type == 'stop':
             logger.info("Received stop signal from server")
             self.stop_event.set()
+
+        # 🔥 NEW: server detected a worker died → new work is available
+        elif msg_type == "work_available":
+            logger.info("Server says new work is available — requesting work now")
+            if not self.stop_event.is_set() and self.connected:
+                self.send_json({"type": "work_request"})
 
         else:
             logger.debug(f"Unknown message from server: {msg_type}")
@@ -290,6 +299,7 @@ class PasswordCrackingWorker:
 
     def start(self):
         logger.info(f"Starting worker (threads={self.num_threads})")
+
         def _signal_handler(sig, frame):
             logger.info("Shutdown signal received")
             self.stop_event.set()
@@ -340,3 +350,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
